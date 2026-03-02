@@ -1,0 +1,69 @@
+# Dependency directories
+node_modules/
+
+# Environment variables
+.env
+.env.local
+.env.production
+.env.development
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Database files
+*.db
+*.sqlite
+
+# Coverage directory used by tools like istanbul
+coverage/
+.nyc_output/
+
+# Build outputs
+dist/
+build/
+
+# IDE - VSCode
+.vscode/
+*.code-workspace
+
+# IDE - WebStorm
+.idea/
+*.iml
+
+# IDE - Sublime Text
+*.sublime-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Vercel outputs
+.vercel/
+
+# Temporary files
+tmp/
+temp/
+
+# API keys and secrets - but keep this commented so you remember
+# config/
+# secrets/
+
+# Uploads (if your app handles file uploads)
+uploads/
+public/uploads/
+
+# Testing
+.nyc_output/
+coverage/
+
