@@ -33,13 +33,27 @@ const csvUploadSchema = new mongoose.Schema(
       type: Number,
       required: true,
     },
+    // Keep filePath for backward compatibility but make it optional
     filePath: {
       type: String,
-      required: true,
+      required: false,
     },
     mimeType: {
       type: String,
       default: "text/csv",
+    },
+
+    // CLOUDINARY FIELDS - ADD THESE
+    cloudinaryId: {
+      type: String,
+      sparse: true,
+      index: true,
+    },
+    cloudinaryUrl: {
+      type: String,
+    },
+    cloudinaryFolder: {
+      type: String,
     },
 
     // Processing status
@@ -206,6 +220,7 @@ csvUploadSchema.index({ status: 1, createdAt: -1 });
 csvUploadSchema.index({ uploadedBy: 1, createdAt: -1 });
 csvUploadSchema.index({ uploadType: 1, academicSession: 1, semester: 1 });
 csvUploadSchema.index({ batchId: 1 });
+csvUploadSchema.index({ cloudinaryId: 1 }); // Add index for cloudinaryId
 
 // Virtual for processing duration
 csvUploadSchema.virtual("processingDuration").get(function () {
@@ -322,14 +337,14 @@ csvUploadSchema.methods.updateStatus = async function (
   return this.save();
 };
 
-// Static method to get upload statistics - FIXED ObjectId issue
+// Static method to get upload statistics
 csvUploadSchema.statics.getUploadStats = async function (
   userId = null,
   timeRange = "month",
 ) {
   const match = {};
   if (userId) {
-    match.uploadedBy = new mongoose.Types.ObjectId(userId); // FIXED: Use 'new'
+    match.uploadedBy = new mongoose.Types.ObjectId(userId);
   }
 
   // Set date range

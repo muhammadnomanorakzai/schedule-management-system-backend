@@ -67,7 +67,11 @@ const authRoutes = require("./routes/authRoutes");
 // Database Connection
 connectDB();
 
-app.use("/uploads", express.static("uploads"));
+// REMOVE THIS LINE - No local file serving needed
+// app.use("/uploads", express.static("uploads"));
+
+// Keep reports static serving if needed (for generated reports)
+app.use("/reports", express.static(path.join(__dirname, "public/reports")));
 
 app.use("/api/auth", authRoutes);
 app.use("/api/approvals", require("./routes/approvalRoutes"));
@@ -93,7 +97,6 @@ app.use("/api/reports", require("./routes/reportRoutes"));
 app.get("/", (req, res) => {
   res.send("backend is running");
 });
-app.use("/reports", express.static(path.join(__dirname, "public/reports")));
 
 // Error Handling Middleware
 app.use((err, req, res, next) => {

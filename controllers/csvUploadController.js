@@ -10,9 +10,11 @@ import TimeSlot from "../models/TimeSlot.js";
 import Room from "../models/Room.js";
 import csv from "csv-parser";
 import stream from "stream";
-import fs from "fs";
+// Remove fs import
+// import fs from "fs";
 import AcademicSession from "../models/AcademicSession.js";
 import Program from "../models/Program.js";
+import { downloadFromCloudinary } from "../services/cloudinaryService.js";
 
 // @desc    Upload CSV file for bulk processing
 // @route   POST /api/csv/upload
@@ -89,7 +91,7 @@ export const uploadCSV = async (req, res) => {
       .populate("academicSession", "name code")
       .populate("program", "name code");
 
-    // 🔥 CONFLICT DETECTION FOR SCHEDULE ENTRIES
+    // Conflict detection for schedule entries
     let conflictResults = null;
     let timetableInfo = null;
     let createdConflicts = [];
@@ -350,7 +352,7 @@ export const getUploadById = async (req, res) => {
   }
 };
 
-// @desc    Retry failed upload
+// @desc    Retry failed upload - UPDATED with Cloudinary
 // @route   POST /api/csv/uploads/:id/retry
 // @access  Private (Admin, HOD)
 export const retryUpload = async (req, res) => {
@@ -371,11 +373,11 @@ export const retryUpload = async (req, res) => {
       });
     }
 
-    // Check if file exists
-    if (!fs.existsSync(upload.filePath)) {
+    // Check if we have cloudinary info
+    if (!upload.cloudinaryUrl && !upload.cloudinaryId) {
       return res.status(400).json({
         success: false,
-        message: "Original CSV file no longer exists",
+        message: "Original CSV file not found in cloud storage",
       });
     }
 
@@ -395,10 +397,26 @@ export const retryUpload = async (req, res) => {
 
     await upload.save();
 
+    // Fetch file from Cloudinary
+    let fileBuffer;
+    try {
+      fileBuffer = await downloadFromCloudinary(upload.cloudinaryUrl);
+    } catch (fetchError) {
+      console.error("Error fetching file from Cloudinary:", fetchError);
+      upload.status = "failed";
+      upload.summary = `Retry failed: Could not fetch file from cloud storage`;
+      await upload.save();
+
+      return res.status(400).json({
+        success: false,
+        message: "Could not retrieve original file from cloud storage",
+      });
+    }
+
     // Create file data object for processing
     const fileData = {
       originalname: upload.originalName,
-      buffer: fs.readFileSync(upload.filePath),
+      buffer: fileBuffer,
       size: upload.fileSize,
       mimetype: upload.mimeType || "text/csv",
     };
@@ -437,11 +455,15 @@ export const retryUpload = async (req, res) => {
   } catch (error) {
     console.error("Error retrying upload:", error);
 
-    // Update upload status to failed
-    if (upload) {
-      upload.status = "failed";
-      upload.summary = `Retry error: ${error.message}`;
-      await upload.save();
+    // Update upload status to failed if upload exists
+    // Note: upload variable is not in scope here, so we need to handle differently
+    try {
+      await CSVUpload.findByIdAndUpdate(req.params.id, {
+        status: "failed",
+        summary: `Retry error: ${error.message}`,
+      });
+    } catch (updateError) {
+      console.error("Error updating upload status:", updateError);
     }
 
     res.status(500).json({
@@ -1220,6 +1242,67 @@ export const debugTimetable = async (req, res) => {
     res.status(500).json({
       success: false,
       message: error.message || "Server error",
+    });
+  }
+};
+
+// @desc    Download error report (new function)
+// @route   GET /api/csv/download-error-report/:id
+// @access  Private
+export const downloadErrorReport = async (req, res) => {
+  try {
+    const upload = await CSVUpload.findById(req.params.id);
+
+    if (!upload) {
+      return res.status(404).json({
+        success: false,
+        message: "Upload not found",
+      });
+    }
+
+    // For now, just return a message that the file is not available
+    // In a production environment, you would generate the report on-demand
+    res.json({
+      success: false,
+      message:
+        "Error report download not implemented yet. The error data is available in the upload record.",
+      errors: upload.errors,
+    });
+  } catch (error) {
+    console.error("Error downloading report:", error);
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+// @desc    Download success report (new function)
+// @route   GET /api/csv/download-success-report/:id
+// @access  Private
+export const downloadSuccessReport = async (req, res) => {
+  try {
+    const upload = await CSVUpload.findById(req.params.id);
+
+    if (!upload) {
+      return res.status(404).json({
+        success: false,
+        message: "Upload not found",
+      });
+    }
+
+    // For now, just return a message that the file is not available
+    res.json({
+      success: false,
+      message:
+        "Success report download not implemented yet. The success data is available in the upload record.",
+      successes: upload.successData,
+    });
+  } catch (error) {
+    console.error("Error downloading report:", error);
+    res.status(500).json({
+      success: false,
+      message: error.message,
     });
   }
 };

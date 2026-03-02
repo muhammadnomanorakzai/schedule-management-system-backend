@@ -15,6 +15,8 @@ const {
   analyzeCSVConflicts,
   getUploadTypes,
   validateCSV,
+  downloadErrorReport,
+  downloadSuccessReport,
 } = require("../controllers/csvUploadController.js");
 const { protect, authorize } = require("../middleware/authMiddleware.js");
 
@@ -66,6 +68,10 @@ router.post("/uploads/:id/retry", authorize("admin", "hod"), retryUpload);
 // Statistics and info
 router.get("/stats", getUploadStats);
 router.get("/upload-types", getUploadTypes);
+
+// Report downloads (NEW)
+router.get("/download-error-report/:id", protect, downloadErrorReport);
+router.get("/download-success-report/:id", protect, downloadSuccessReport);
 
 router.post(
   "/analyze-conflicts",
