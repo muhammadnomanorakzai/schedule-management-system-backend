@@ -13,13 +13,6 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Security Middleware
-app.use(
-  helmet({
-    crossOriginResourcePolicy: false, // Allow CORS
-  }),
-);
-
 // CORS Middleware - Must come BEFORE helmet to work properly
 const allowedOrigins = [
   "http://localhost:5173",
@@ -42,6 +35,13 @@ app.use(
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
+  }),
+);
+
+// Security Middleware
+app.use(
+  helmet({
+    crossOriginResourcePolicy: false, // Allow CORS
   }),
 );
 
