@@ -24,7 +24,6 @@ app.use(
 const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:5174",
-  "https://apexcify-technologys-school-fronten.vercel.app",
   process.env.FRONTEND_URL, // Add from environment variable
 ].filter(Boolean); // Remove undefined values
 
@@ -108,6 +107,10 @@ app.use((err, req, res, next) => {
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+if (process.env.NODE_ENV !== "production") {
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
+
+module.exports = app;
