@@ -91,7 +91,7 @@ app.use("/api/reports", require("./routes/reportRoutes"));
 
 // Root Route - Beautiful Landing Page
 app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "views", "index.html"));
+  res.send("backend is running");
 });
 app.use("/reports", express.static(path.join(__dirname, "public/reports")));
 
