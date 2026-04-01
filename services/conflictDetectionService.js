@@ -28,12 +28,11 @@ class ConflictDetectionEngine {
 
     try {
       const timetable = await Timetable.findById(timetableId)
-        .populate(
-          "schedule.timeSlot",
-          "startTime endTime slotType durationMinutes",
-        )
-        .populate("schedule.courseAllocation", "teacher course section")
-        .populate("schedule.room", "name code type capacity")
+        .populate({
+          path: "schedule.timeSlot",
+          select:
+            "startTime endTime slotType durationMinutes name isActive availableDays",
+        })
         .populate({
           path: "schedule.courseAllocation",
           populate: [
@@ -41,6 +40,10 @@ class ConflictDetectionEngine {
             { path: "course", select: "code name creditHours department" },
             { path: "section", select: "name code" },
           ],
+        })
+        .populate({
+          path: "schedule.room",
+          select: "name code type capacity isActive",
         });
 
       if (!timetable) {
@@ -61,23 +64,32 @@ class ConflictDetectionEngine {
       for (const [ruleName, detectionFunction] of Object.entries(
         this.detectionRules,
       )) {
-        const ruleConflicts = await detectionFunction(timetable);
-        if (ruleConflicts && ruleConflicts.length > 0) {
-          allConflicts.push(...ruleConflicts);
+        try {
+          const ruleConflicts = await detectionFunction(timetable);
+          if (ruleConflicts && ruleConflicts.length > 0) {
+            allConflicts.push(...ruleConflicts);
+          }
+        } catch (ruleError) {
+          console.error(`Error in detection rule ${ruleName}:`, ruleError);
+          // Continue with other rules even if one fails
         }
       }
 
       // Save detected conflicts
       const savedConflicts = [];
       for (const conflict of allConflicts) {
-        const savedConflict = await this.saveConflict({
-          ...conflict,
-          timetable: timetableId,
-          detectedBy: userId,
-          detectionMethod: options.detectionMethod || "manual",
-          detectionSource: options.detectionSource || "system_check",
-        });
-        savedConflicts.push(savedConflict);
+        try {
+          const savedConflict = await this.saveConflict({
+            ...conflict,
+            timetable: timetableId,
+            detectedBy: userId,
+            detectionMethod: options.detectionMethod || "manual",
+            detectionSource: options.detectionSource || "system_check",
+          });
+          savedConflicts.push(savedConflict);
+        } catch (saveError) {
+          console.error("Error saving conflict:", saveError);
+        }
       }
 
       const detectionTime = Date.now() - startTime;
@@ -109,6 +121,7 @@ class ConflictDetectionEngine {
 
     for (const entry of timetable.schedule) {
       if (!entry.courseAllocation?.teacher) continue;
+      if (!entry.timeSlot) continue; // Skip if no time slot
 
       const teacherId = entry.courseAllocation.teacher._id.toString();
       const key = `${entry.day}-${entry.timeSlot._id}`;
@@ -125,13 +138,13 @@ class ConflictDetectionEngine {
           conflictType: "teacher_schedule",
           severity: "critical",
           description: `Teacher ${entry.courseAllocation.teacher.name} has overlapping classes`,
-          detailedMessage: `Teacher is scheduled for ${entry.courseAllocation.course?.code} and ${existingEntry.courseAllocation.course?.code} at the same time`,
+          detailedMessage: `Teacher is scheduled for ${entry.courseAllocation.course?.code || "Unknown"} and ${existingEntry.courseAllocation.course?.code || "Unknown"} at the same time`,
           scheduleEntries: [
             {
               entry: entry._id,
               timetable: timetable._id,
               day: entry.day,
-              timeSlot: entry.timeSlot._id,
+              timeSlot: entry.timeSlot?._id,
               courseAllocation: entry.courseAllocation._id,
               room: entry.room?._id,
             },
@@ -139,7 +152,7 @@ class ConflictDetectionEngine {
               entry: existingEntry._id,
               timetable: timetable._id,
               day: existingEntry.day,
-              timeSlot: existingEntry.timeSlot._id,
+              timeSlot: existingEntry.timeSlot?._id,
               courseAllocation: existingEntry.courseAllocation._id,
               room: existingEntry.room?._id,
             },
@@ -147,7 +160,7 @@ class ConflictDetectionEngine {
           detectedData: {
             teacher: teacherId,
             teacherName: entry.courseAllocation.teacher.name,
-            timeSlot: entry.timeSlot._id,
+            timeSlot: entry.timeSlot?._id,
             day: entry.day,
           },
           suggestedResolutions: await this.suggestTeacherConflictResolutions(
@@ -171,6 +184,7 @@ class ConflictDetectionEngine {
 
     for (const entry of timetable.schedule) {
       if (!entry.room) continue;
+      if (!entry.timeSlot) continue; // Skip if no time slot
 
       const roomId = entry.room._id.toString();
       const key = `${entry.day}-${entry.timeSlot._id}`;
@@ -186,30 +200,30 @@ class ConflictDetectionEngine {
         conflicts.push({
           conflictType: "room_occupancy",
           severity: "high",
-          description: `Room ${entry.room.code} is double-booked`,
-          detailedMessage: `Room is booked for ${entry.courseAllocation.course?.code} and ${existingEntry.courseAllocation.course?.code} at the same time`,
+          description: `Room ${entry.room.code || entry.room.name} is double-booked`,
+          detailedMessage: `Room is booked for ${entry.courseAllocation?.course?.code || "Unknown"} and ${existingEntry.courseAllocation?.course?.code || "Unknown"} at the same time`,
           scheduleEntries: [
             {
               entry: entry._id,
               timetable: timetable._id,
               day: entry.day,
-              timeSlot: entry.timeSlot._id,
-              courseAllocation: entry.courseAllocation._id,
+              timeSlot: entry.timeSlot?._id,
+              courseAllocation: entry.courseAllocation?._id,
               room: entry.room._id,
             },
             {
               entry: existingEntry._id,
               timetable: timetable._id,
               day: existingEntry.day,
-              timeSlot: existingEntry.timeSlot._id,
-              courseAllocation: existingEntry.courseAllocation._id,
+              timeSlot: existingEntry.timeSlot?._id,
+              courseAllocation: existingEntry.courseAllocation?._id,
               room: existingEntry.room._id,
             },
           ],
           detectedData: {
             room: roomId,
-            roomCode: entry.room.code,
-            timeSlot: entry.timeSlot._id,
+            roomCode: entry.room.code || entry.room.name,
+            timeSlot: entry.timeSlot?._id,
             day: entry.day,
           },
           suggestedResolutions: await this.suggestRoomConflictResolutions(
@@ -233,6 +247,7 @@ class ConflictDetectionEngine {
 
     for (const entry of timetable.schedule) {
       if (!entry.courseAllocation?.course) continue;
+      if (!entry.timeSlot) continue; // Skip if no time slot
 
       const courseId = entry.courseAllocation.course._id.toString();
       const key = `${entry.day}-${entry.timeSlot._id}`;
@@ -253,7 +268,7 @@ class ConflictDetectionEngine {
               entry: entry._id,
               timetable: timetable._id,
               day: entry.day,
-              timeSlot: entry.timeSlot._id,
+              timeSlot: entry.timeSlot?._id,
               courseAllocation: entry.courseAllocation._id,
               room: entry.room?._id,
             },
@@ -261,7 +276,7 @@ class ConflictDetectionEngine {
           detectedData: {
             course: courseId,
             courseCode: entry.courseAllocation.course.code,
-            timeSlot: entry.timeSlot._id,
+            timeSlot: entry.timeSlot?._id,
             day: entry.day,
           },
         });
@@ -286,12 +301,8 @@ class ConflictDetectionEngine {
     const conflicts = [];
 
     for (const entry of timetable.schedule) {
-      if (
-        !entry.courseAllocation?.teacher?.department ||
-        !entry.courseAllocation?.course?.department
-      ) {
-        continue;
-      }
+      if (!entry.courseAllocation?.teacher?.department) continue;
+      if (!entry.courseAllocation?.course?.department) continue;
 
       const teacherDept = entry.courseAllocation.teacher.department.toString();
       const courseDept = entry.courseAllocation.course.department.toString();
@@ -307,7 +318,7 @@ class ConflictDetectionEngine {
               entry: entry._id,
               timetable: timetable._id,
               day: entry.day,
-              timeSlot: entry.timeSlot._id,
+              timeSlot: entry.timeSlot?._id,
               courseAllocation: entry.courseAllocation._id,
               room: entry.room?._id,
             },
@@ -339,41 +350,43 @@ class ConflictDetectionEngine {
     return conflicts;
   }
 
-  // 8. Resource Unavailable Conflicts
+  // 8. Resource Unavailable Conflicts (FIXED)
   async detectResourceConflicts(timetable) {
     const conflicts = [];
 
     for (const entry of timetable.schedule) {
-      if (entry.room) {
+      // Check room availability - FIXED: Check if entry.room exists
+      if (entry.room && entry.room._id) {
         const room = await Room.findById(entry.room._id);
         if (room && !room.isActive) {
           conflicts.push({
             conflictType: "resource_unavailable",
             severity: "high",
-            description: `Room ${room.code} is not active`,
+            description: `Room ${room.code || room.name} is not active`,
             detailedMessage: `Assigned room is marked as inactive`,
             scheduleEntries: [
               {
                 entry: entry._id,
                 timetable: timetable._id,
                 day: entry.day,
-                timeSlot: entry.timeSlot._id,
-                courseAllocation: entry.courseAllocation._id,
+                timeSlot: entry.timeSlot?._id,
+                courseAllocation: entry.courseAllocation?._id,
                 room: entry.room._id,
               },
             ],
             detectedData: {
               room: room._id,
-              roomCode: room.code,
+              roomCode: room.code || room.name,
               roomStatus: room.isActive ? "active" : "inactive",
             },
           });
         }
       }
 
-      // Check time slot availability
-      if (entry.timeSlot) {
+      // Check time slot availability - FIXED: Check if entry.timeSlot exists
+      if (entry.timeSlot && entry.timeSlot._id) {
         const timeSlot = await TimeSlot.findById(entry.timeSlot._id);
+
         if (timeSlot && !timeSlot.isActive) {
           conflicts.push({
             conflictType: "resource_unavailable",
@@ -386,7 +399,7 @@ class ConflictDetectionEngine {
                 timetable: timetable._id,
                 day: entry.day,
                 timeSlot: entry.timeSlot._id,
-                courseAllocation: entry.courseAllocation._id,
+                courseAllocation: entry.courseAllocation?._id,
                 room: entry.room?._id,
               },
             ],
@@ -398,30 +411,36 @@ class ConflictDetectionEngine {
           });
         }
 
-        // Check if time slot is available on the scheduled day
-        if (timeSlot && !timeSlot.availableDays.includes(entry.day)) {
-          conflicts.push({
-            conflictType: "resource_unavailable",
-            severity: "critical",
-            description: `Time slot not available on ${entry.day}`,
-            detailedMessage: `${timeSlot.name} is not available on ${entry.day}. Available days: ${timeSlot.availableDays.join(", ")}`,
-            scheduleEntries: [
-              {
-                entry: entry._id,
-                timetable: timetable._id,
-                day: entry.day,
-                timeSlot: entry.timeSlot._id,
-                courseAllocation: entry.courseAllocation._id,
-                room: entry.room?._id,
+        // Check if time slot is available on the scheduled day - FIXED: Check availableDays
+        if (
+          timeSlot &&
+          timeSlot.availableDays &&
+          timeSlot.availableDays.length > 0
+        ) {
+          if (!timeSlot.availableDays.includes(entry.day)) {
+            conflicts.push({
+              conflictType: "resource_unavailable",
+              severity: "critical",
+              description: `Time slot not available on ${entry.day}`,
+              detailedMessage: `${timeSlot.name} is not available on ${entry.day}. Available days: ${timeSlot.availableDays.join(", ")}`,
+              scheduleEntries: [
+                {
+                  entry: entry._id,
+                  timetable: timetable._id,
+                  day: entry.day,
+                  timeSlot: entry.timeSlot._id,
+                  courseAllocation: entry.courseAllocation?._id,
+                  room: entry.room?._id,
+                },
+              ],
+              detectedData: {
+                timeSlot: timeSlot._id,
+                timeSlotName: timeSlot.name,
+                scheduledDay: entry.day,
+                availableDays: timeSlot.availableDays,
               },
-            ],
-            detectedData: {
-              timeSlot: timeSlot._id,
-              timeSlotName: timeSlot.name,
-              scheduledDay: entry.day,
-              availableDays: timeSlot.availableDays,
-            },
-          });
+            });
+          }
         }
       }
     }
@@ -442,6 +461,7 @@ class ConflictDetectionEngine {
     // Group entries by teacher and day
     for (const entry of timetable.schedule) {
       if (!entry.courseAllocation?.teacher) continue;
+      if (!entry.timeSlot) continue; // Skip if no time slot
 
       const teacherId = entry.courseAllocation.teacher._id.toString();
       const day = entry.day;
@@ -477,13 +497,13 @@ class ConflictDetectionEngine {
               conflictType: "back_to_back",
               severity: "medium",
               description: `Teacher has back-to-back classes on ${day}`,
-              detailedMessage: `${previous.entry.courseAllocation.course?.code} ends at ${previous.timeSlot.endTime}, ${current.entry.courseAllocation.course?.code} starts at ${current.timeSlot.startTime}`,
+              detailedMessage: `${previous.entry.courseAllocation.course?.code || "Class"} ends at ${previous.timeSlot.endTime}, ${current.entry.courseAllocation.course?.code || "Class"} starts at ${current.timeSlot.startTime}`,
               scheduleEntries: [
                 {
                   entry: previous.entry._id,
                   timetable: timetable._id,
                   day: previous.entry.day,
-                  timeSlot: previous.entry.timeSlot._id,
+                  timeSlot: previous.entry.timeSlot?._id,
                   courseAllocation: previous.entry.courseAllocation._id,
                   room: previous.entry.room?._id,
                 },
@@ -491,7 +511,7 @@ class ConflictDetectionEngine {
                   entry: current.entry._id,
                   timetable: timetable._id,
                   day: current.entry.day,
-                  timeSlot: current.entry.timeSlot._id,
+                  timeSlot: current.entry.timeSlot?._id,
                   courseAllocation: current.entry.courseAllocation._id,
                   room: current.entry.room?._id,
                 },
@@ -522,10 +542,12 @@ class ConflictDetectionEngine {
     // Calculate daily hours per teacher
     for (const entry of timetable.schedule) {
       if (!entry.courseAllocation?.teacher) continue;
+      if (!entry.timeSlot) continue; // Skip if no time slot
 
       const teacherId = entry.courseAllocation.teacher._id.toString();
       const day = entry.day;
-      const durationHours = entry.timeSlot.durationMinutes / 60;
+      const durationMinutes = entry.timeSlot.durationMinutes || 60;
+      const durationHours = durationMinutes / 60;
 
       if (!teacherHoursByDay[teacherId]) {
         teacherHoursByDay[teacherId] = {};
@@ -559,7 +581,7 @@ class ConflictDetectionEngine {
               entry: entry._id,
               timetable: timetable._id,
               day: entry.day,
-              timeSlot: entry.timeSlot._id,
+              timeSlot: entry.timeSlot?._id,
               courseAllocation: entry.courseAllocation._id,
               room: entry.room?._id,
             })),
@@ -584,8 +606,9 @@ class ConflictDetectionEngine {
 
   // Helper method to parse time string to minutes
   parseTime(timeString) {
+    if (!timeString) return 0;
     const [hours, minutes] = timeString.split(":").map(Number);
-    return hours * 60 + minutes;
+    return hours * 60 + (minutes || 0);
   }
 
   // Save conflict to database
@@ -622,73 +645,77 @@ class ConflictDetectionEngine {
   async suggestTeacherConflictResolutions(entry1, entry2, timetable) {
     const suggestions = [];
 
-    // Get available time slots
-    const allTimeSlots = await TimeSlot.find({ isActive: true }).sort(
-      "slotNumber",
-    );
-    const availableSlots = allTimeSlots.filter((slot) =>
-      slot.availableDays.includes(entry1.day),
-    );
+    try {
+      // Get available time slots
+      const allTimeSlots = await TimeSlot.find({ isActive: true }).sort(
+        "slotNumber",
+      );
+      const availableSlots = allTimeSlots.filter((slot) =>
+        slot.availableDays?.includes(entry1.day),
+      );
 
-    // Suggestion 1: Change time for entry1
-    suggestions.push({
-      type: "time_change",
-      description: `Move ${entry1.courseAllocation.course?.code} to different time on ${entry1.day}`,
-      priority: 1,
-      feasibility: 70,
-      impact: "low",
-      details: {
-        entryId: entry1._id,
-        currentTimeSlot: entry1.timeSlot._id,
-        availableTimeSlots: availableSlots.map((slot) => ({
-          id: slot._id,
-          name: slot.name,
-          timeRange: `${slot.startTime}-${slot.endTime}`,
-        })),
-      },
-    });
-
-    // Suggestion 2: Change time for entry2
-    suggestions.push({
-      type: "time_change",
-      description: `Move ${entry2.courseAllocation.course?.code} to different time on ${entry2.day}`,
-      priority: 2,
-      feasibility: 70,
-      impact: "low",
-      details: {
-        entryId: entry2._id,
-        currentTimeSlot: entry2.timeSlot._id,
-        availableTimeSlots: availableSlots.map((slot) => ({
-          id: slot._id,
-          name: slot.name,
-          timeRange: `${slot.startTime}-${slot.endTime}`,
-        })),
-      },
-    });
-
-    // Suggestion 3: Change day for entry1
-    if (entry1.courseAllocation) {
-      const availableDays = [
-        "Monday",
-        "Tuesday",
-        "Wednesday",
-        "Thursday",
-        "Friday",
-      ];
-      const otherDays = availableDays.filter((day) => day !== entry1.day);
-
+      // Suggestion 1: Change time for entry1
       suggestions.push({
-        type: "day_change",
-        description: `Move ${entry1.courseAllocation.course?.code} to different day`,
-        priority: 3,
-        feasibility: 50,
-        impact: "medium",
+        type: "time_change",
+        description: `Move ${entry1.courseAllocation?.course?.code || "class"} to different time on ${entry1.day}`,
+        priority: 1,
+        feasibility: 70,
+        impact: "low",
         details: {
           entryId: entry1._id,
-          currentDay: entry1.day,
-          availableDays: otherDays,
+          currentTimeSlot: entry1.timeSlot?._id,
+          availableTimeSlots: availableSlots.map((slot) => ({
+            id: slot._id,
+            name: slot.name,
+            timeRange: `${slot.startTime}-${slot.endTime}`,
+          })),
         },
       });
+
+      // Suggestion 2: Change time for entry2
+      suggestions.push({
+        type: "time_change",
+        description: `Move ${entry2.courseAllocation?.course?.code || "class"} to different time on ${entry2.day}`,
+        priority: 2,
+        feasibility: 70,
+        impact: "low",
+        details: {
+          entryId: entry2._id,
+          currentTimeSlot: entry2.timeSlot?._id,
+          availableTimeSlots: availableSlots.map((slot) => ({
+            id: slot._id,
+            name: slot.name,
+            timeRange: `${slot.startTime}-${slot.endTime}`,
+          })),
+        },
+      });
+
+      // Suggestion 3: Change day for entry1
+      if (entry1.courseAllocation) {
+        const availableDays = [
+          "Monday",
+          "Tuesday",
+          "Wednesday",
+          "Thursday",
+          "Friday",
+        ];
+        const otherDays = availableDays.filter((day) => day !== entry1.day);
+
+        suggestions.push({
+          type: "day_change",
+          description: `Move ${entry1.courseAllocation.course?.code || "class"} to different day`,
+          priority: 3,
+          feasibility: 50,
+          impact: "medium",
+          details: {
+            entryId: entry1._id,
+            currentDay: entry1.day,
+            availableDays: otherDays,
+          },
+        });
+      }
+    } catch (error) {
+      console.error("Error suggesting teacher conflict resolutions:", error);
     }
 
     return suggestions;
@@ -698,52 +725,56 @@ class ConflictDetectionEngine {
   async suggestRoomConflictResolutions(entry1, entry2, timetable) {
     const suggestions = [];
 
-    // Get available rooms
-    const availableRooms = await Room.find({
-      isActive: true,
-      capacity: { $gte: entry1.courseAllocation?.maxStudents || 50 },
-    });
+    try {
+      // Get available rooms
+      const availableRooms = await Room.find({
+        isActive: true,
+        capacity: { $gte: entry1.courseAllocation?.maxStudents || 30 },
+      }).limit(10);
 
-    // Suggestion 1: Change room for entry1
-    if (availableRooms.length > 0) {
-      suggestions.push({
-        type: "room_change",
-        description: `Assign different room to ${entry1.courseAllocation.course?.code}`,
-        priority: 1,
-        feasibility: 80,
-        impact: "low",
-        details: {
-          entryId: entry1._id,
-          currentRoom: entry1.room?._id,
-          availableRooms: availableRooms.map((room) => ({
-            id: room._id,
-            code: room.code,
-            name: room.name,
-            capacity: room.capacity,
-          })),
-        },
-      });
-    }
+      // Suggestion 1: Change room for entry1
+      if (availableRooms.length > 0) {
+        suggestions.push({
+          type: "room_change",
+          description: `Assign different room to ${entry1.courseAllocation?.course?.code || "class"}`,
+          priority: 1,
+          feasibility: 80,
+          impact: "low",
+          details: {
+            entryId: entry1._id,
+            currentRoom: entry1.room?._id,
+            availableRooms: availableRooms.map((room) => ({
+              id: room._id,
+              code: room.code || room.name,
+              name: room.name,
+              capacity: room.capacity,
+            })),
+          },
+        });
+      }
 
-    // Suggestion 2: Change room for entry2
-    if (availableRooms.length > 0) {
-      suggestions.push({
-        type: "room_change",
-        description: `Assign different room to ${entry2.courseAllocation.course?.code}`,
-        priority: 2,
-        feasibility: 80,
-        impact: "low",
-        details: {
-          entryId: entry2._id,
-          currentRoom: entry2.room?._id,
-          availableRooms: availableRooms.map((room) => ({
-            id: room._id,
-            code: room.code,
-            name: room.name,
-            capacity: room.capacity,
-          })),
-        },
-      });
+      // Suggestion 2: Change room for entry2
+      if (availableRooms.length > 0) {
+        suggestions.push({
+          type: "room_change",
+          description: `Assign different room to ${entry2.courseAllocation?.course?.code || "class"}`,
+          priority: 2,
+          feasibility: 80,
+          impact: "low",
+          details: {
+            entryId: entry2._id,
+            currentRoom: entry2.room?._id,
+            availableRooms: availableRooms.map((room) => ({
+              id: room._id,
+              code: room.code || room.name,
+              name: room.name,
+              capacity: room.capacity,
+            })),
+          },
+        });
+      }
+    } catch (error) {
+      console.error("Error suggesting room conflict resolutions:", error);
     }
 
     return suggestions;
@@ -753,44 +784,48 @@ class ConflictDetectionEngine {
   async suggestMaxHoursResolutions(entries, timetable) {
     const suggestions = [];
 
-    // Group entries by course
-    const courses = {};
-    entries.forEach((entry) => {
-      const courseId = entry.courseAllocation?.course?._id;
-      if (courseId) {
-        if (!courses[courseId]) {
-          courses[courseId] = [];
+    try {
+      // Group entries by course
+      const courses = {};
+      entries.forEach((entry) => {
+        const courseId = entry.courseAllocation?.course?._id;
+        if (courseId) {
+          if (!courses[courseId]) {
+            courses[courseId] = [];
+          }
+          courses[courseId].push(entry);
         }
-        courses[courseId].push(entry);
-      }
-    });
+      });
 
-    // Suggestion: Move one course to different day
-    for (const courseId in courses) {
-      if (courses[courseId].length > 0) {
-        const entry = courses[courseId][0];
-        const availableDays = [
-          "Monday",
-          "Tuesday",
-          "Wednesday",
-          "Thursday",
-          "Friday",
-        ].filter((day) => day !== entry.day);
+      // Suggestion: Move one course to different day
+      for (const courseId in courses) {
+        if (courses[courseId].length > 0) {
+          const entry = courses[courseId][0];
+          const availableDays = [
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+          ].filter((day) => day !== entry.day);
 
-        suggestions.push({
-          type: "day_change",
-          description: `Move ${entry.courseAllocation.course?.code} to different day to reduce daily load`,
-          priority: 1,
-          feasibility: 60,
-          impact: "medium",
-          details: {
-            entryId: entry._id,
-            currentDay: entry.day,
-            availableDays: availableDays,
-            courseCode: entry.courseAllocation.course?.code,
-          },
-        });
+          suggestions.push({
+            type: "day_change",
+            description: `Move ${entry.courseAllocation?.course?.code || "class"} to different day to reduce daily load`,
+            priority: 1,
+            feasibility: 60,
+            impact: "medium",
+            details: {
+              entryId: entry._id,
+              currentDay: entry.day,
+              availableDays: availableDays,
+              courseCode: entry.courseAllocation?.course?.code,
+            },
+          });
+        }
       }
+    } catch (error) {
+      console.error("Error suggesting max hours resolutions:", error);
     }
 
     return suggestions;
@@ -897,70 +932,84 @@ class ConflictDetectionEngine {
   async autoResolveRoomConflict(conflict, timetable) {
     const { scheduleEntries } = conflict;
 
-    if (scheduleEntries.length !== 2) {
+    if (!scheduleEntries || scheduleEntries.length !== 2) {
       return { success: false, reason: "Invalid number of entries" };
     }
 
-    // Get available rooms
-    const availableRooms = await Room.find({
-      isActive: true,
-      _id: { $nin: scheduleEntries.map((e) => e.room).filter(Boolean) },
-    }).limit(5);
+    try {
+      // Get available rooms
+      const availableRooms = await Room.find({
+        isActive: true,
+        _id: { $nin: scheduleEntries.map((e) => e.room).filter(Boolean) },
+      }).limit(5);
 
-    if (availableRooms.length === 0) {
-      return { success: false, reason: "No available rooms found" };
+      if (availableRooms.length === 0) {
+        return { success: false, reason: "No available rooms found" };
+      }
+
+      // Use first available room
+      const newRoom = availableRooms[0];
+      const entryIndex = timetable.schedule.findIndex(
+        (e) =>
+          e._id && e._id.toString() === scheduleEntries[0]?.entry?.toString(),
+      );
+
+      if (entryIndex === -1) {
+        return { success: false, reason: "Schedule entry not found" };
+      }
+
+      return {
+        success: true,
+        type: "auto_room_change",
+        notes: `Automatically assigned room ${newRoom.code || newRoom.name}`,
+        changes: {
+          entryIndex,
+          roomId: newRoom._id,
+        },
+      };
+    } catch (error) {
+      console.error("Error auto-resolving room conflict:", error);
+      return { success: false, reason: error.message };
     }
-
-    // Use first available room
-    const newRoom = availableRooms[0];
-    const entryIndex = timetable.schedule.findIndex(
-      (e) => e._id.toString() === scheduleEntries[0].entry,
-    );
-
-    if (entryIndex === -1) {
-      return { success: false, reason: "Schedule entry not found" };
-    }
-
-    return {
-      success: true,
-      type: "auto_room_change",
-      notes: `Automatically assigned room ${newRoom.code}`,
-      changes: {
-        entryIndex,
-        roomId: newRoom._id,
-      },
-    };
   }
 
   // Auto-resolve resource conflict
   async autoResolveResourceConflict(conflict, timetable) {
     const { detectedData } = conflict;
 
-    if (detectedData.roomStatus === "inactive") {
-      // Find alternative room
-      const availableRooms = await Room.find({
-        isActive: true,
-        capacity: { $gte: 30 },
-      }).limit(5);
+    if (!detectedData) {
+      return { success: false, reason: "No detection data" };
+    }
 
-      if (availableRooms.length > 0) {
-        const newRoom = availableRooms[0];
-        const entryIndex = timetable.schedule.findIndex(
-          (e) => e.room?._id?.toString() === detectedData.room,
-        );
+    try {
+      if (detectedData.roomStatus === "inactive" && detectedData.room) {
+        // Find alternative room
+        const availableRooms = await Room.find({
+          isActive: true,
+          capacity: { $gte: 30 },
+        }).limit(5);
 
-        if (entryIndex !== -1) {
-          return {
-            success: true,
-            type: "auto_room_change",
-            notes: `Automatically reassigned from inactive room to ${newRoom.code}`,
-            changes: {
-              entryIndex,
-              roomId: newRoom._id,
-            },
-          };
+        if (availableRooms.length > 0) {
+          const newRoom = availableRooms[0];
+          const entryIndex = timetable.schedule.findIndex(
+            (e) => e.room?._id?.toString() === detectedData.room?.toString(),
+          );
+
+          if (entryIndex !== -1) {
+            return {
+              success: true,
+              type: "auto_room_change",
+              notes: `Automatically reassigned from inactive room to ${newRoom.code || newRoom.name}`,
+              changes: {
+                entryIndex,
+                roomId: newRoom._id,
+              },
+            };
+          }
         }
       }
+    } catch (error) {
+      console.error("Error auto-resolving resource conflict:", error);
     }
 
     return {

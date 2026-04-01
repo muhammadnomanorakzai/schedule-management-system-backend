@@ -43,18 +43,18 @@ const csvUploadSchema = new mongoose.Schema(
       default: "text/csv",
     },
 
-    // CLOUDINARY FIELDS - ADD THESE
-    cloudinaryId: {
-      type: String,
-      sparse: true,
-      index: true,
-    },
-    cloudinaryUrl: {
-      type: String,
-    },
-    cloudinaryFolder: {
-      type: String,
-    },
+    // CLOUDINARY FIELDS - REMOVED
+    // cloudinaryId: {
+    //   type: String,
+    //   sparse: true,
+    //   index: true,
+    // },
+    // cloudinaryUrl: {
+    //   type: String,
+    // },
+    // cloudinaryFolder: {
+    //   type: String,
+    // },
 
     // Processing status
     status: {
@@ -220,7 +220,8 @@ csvUploadSchema.index({ status: 1, createdAt: -1 });
 csvUploadSchema.index({ uploadedBy: 1, createdAt: -1 });
 csvUploadSchema.index({ uploadType: 1, academicSession: 1, semester: 1 });
 csvUploadSchema.index({ batchId: 1 });
-csvUploadSchema.index({ cloudinaryId: 1 }); // Add index for cloudinaryId
+// Remove cloudinary index
+// csvUploadSchema.index({ cloudinaryId: 1 });
 
 // Virtual for processing duration
 csvUploadSchema.virtual("processingDuration").get(function () {

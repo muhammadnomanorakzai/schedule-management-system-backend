@@ -74,8 +74,8 @@ app.use("/reports", express.static(path.join(__dirname, "public/reports")));
 
 app.use("/api/auth", authRoutes);
 app.use("/api/approvals", require("./routes/approvalRoutes"));
-app.use("/api/classes", require("./routes/classRoutes"));
-app.use("/api/students", require("./routes/studentRoutes"));
+// app.use("/api/classes", require("./routes/classRoutes"));
+// app.use("/api/students", require("./routes/studentRoutes"));
 app.use("/api/teachers", require("./routes/teacherRoutes"));
 app.use("/api/subjects", require("./routes/subjectRoutes"));
 app.use("/api/departments", require("./routes/departmentRoutes"));

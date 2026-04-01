@@ -19,188 +19,378 @@ import CSVUpload from "../models/CSVUpload.js";
 import Department from "../models/Department.js";
 import Conflict from "../models/Conflict.js";
 
-// Import Cloudinary services
-import {
-  uploadToCloudinary,
-  deleteFromCloudinary,
-  downloadFromCloudinary,
-} from "../services/cloudinaryService.js";
-
-// Conflict Detection Engine
 class ConflictDetectionEngine {
-  async detectConflictsForUpload(recordIds, userId, source) {
+  async detectConflictsForUpload(recordIds, userId, source, uploadId = null) {
     console.log(
-      `Detecting conflicts for upload, User: ${userId}, Source: ${source}`,
+      `Detecting conflicts for upload, User: ${userId}, Source: ${source}, Records: ${recordIds.length}`,
     );
 
-    const conflicts = [];
-
     try {
-      // Find all timetables that might have conflicts
+      // Get the upload record to access row mapping if uploadId is provided
+      let rowMap = new Map();
+      if (uploadId) {
+        const upload = await CSVUpload.findById(uploadId).lean();
+        if (upload && upload.successData) {
+          upload.successData.forEach((item) => {
+            if (item.recordId) {
+              rowMap.set(item.recordId.toString(), item.row);
+            }
+          });
+        }
+      }
+
+      // Find all relevant timetables with proper population
       const timetables = await Timetable.find({
+        _id: { $in: recordIds },
         status: { $ne: "archived" },
       })
         .populate({
           path: "schedule.courseAllocation",
-          populate: [{ path: "teacher" }, { path: "course" }],
+          populate: [
+            { path: "teacher", select: "_id name email" },
+            { path: "course", select: "_id code name" },
+          ],
         })
-        .populate("schedule.room")
-        .populate("schedule.timeSlot");
+        .populate("schedule.room", "_id roomNumber code name")
+        .populate("schedule.timeSlot", "_id name timeRange")
+        .lean();
 
+      console.log(
+        `Found ${timetables.length} timetables to check for conflicts`,
+      );
+
+      const conflicts = [];
+      const bulkOps = [];
+      const conflictMap = new Map(); // To avoid duplicate conflicts
+
+      // Build a comprehensive schedule map across ALL timetables
+      const teacherScheduleMap = new Map(); // key: teacherId-day-timeSlotId
+      const roomScheduleMap = new Map(); // key: roomId-day-timeSlotId
+
+      // First pass: Build maps of ALL existing schedule entries
       for (const timetable of timetables) {
-        console.log(
-          `Checking timetable ${timetable.name} with ${timetable.schedule.length} entries`,
-        );
-
-        const teacherSchedule = {};
-        const roomSchedule = {};
-
         for (const entry of timetable.schedule) {
           if (!entry.timeSlot) continue;
 
           const timeKey = `${entry.day}-${entry.timeSlot._id}`;
 
-          // Check teacher conflicts
+          // Track teacher schedule
           if (entry.courseAllocation?.teacher) {
-            const teacherKey = `${timeKey}-${entry.courseAllocation.teacher._id}`;
-            if (teacherSchedule[teacherKey]) {
-              const conflictData = {
-                type: "teacher_schedule",
-                conflictType: "teacher_schedule",
-                severity: "critical",
-                description: `Teacher ${entry.courseAllocation.teacher.name} has overlapping classes on ${entry.day} at ${entry.timeSlot.name}`,
-                timetable: timetable._id,
-                scheduleEntry: entry._id,
-                teacher: entry.courseAllocation.teacher._id,
-                detectionSource: source,
-                status: "detected",
-                detectedBy: userId,
-              };
+            const teacherKey = `${entry.courseAllocation.teacher._id}-${timeKey}`;
 
-              // Remove undefined fields
-              Object.keys(conflictData).forEach(
-                (key) =>
-                  conflictData[key] === undefined && delete conflictData[key],
-              );
-
-              const conflict = new Conflict(conflictData);
-              await conflict.save();
-              conflicts.push(conflict);
-            } else {
-              teacherSchedule[teacherKey] = true;
+            if (!teacherScheduleMap.has(teacherKey)) {
+              teacherScheduleMap.set(teacherKey, []);
             }
+            teacherScheduleMap.get(teacherKey).push({
+              timetableId: timetable._id,
+              timetableName: timetable.name || `${timetable._id}`,
+              entryId: entry._id,
+              course: entry.courseAllocation.course?.code || "Unknown",
+              teacher: entry.courseAllocation.teacher,
+              day: entry.day,
+              timeSlot: entry.timeSlot,
+            });
           }
 
-          // Check room conflicts
+          // Track room schedule
           if (entry.room) {
-            const roomKey = `${timeKey}-${entry.room._id}`;
-            if (roomSchedule[roomKey]) {
-              const conflictData = {
-                type: "room_occupancy",
-                conflictType: "room_occupancy",
-                severity: "high",
-                description: `Room ${entry.room.roomNumber || entry.room.code} is double-booked on ${entry.day} at ${entry.timeSlot.name}`,
-                timetable: timetable._id,
-                scheduleEntry: entry._id,
-                room: entry.room._id,
-                detectionSource: source,
-                status: "detected",
-                detectedBy: userId,
-              };
+            const roomKey = `${entry.room._id}-${timeKey}`;
 
-              Object.keys(conflictData).forEach(
-                (key) =>
-                  conflictData[key] === undefined && delete conflictData[key],
-              );
+            if (!roomScheduleMap.has(roomKey)) {
+              roomScheduleMap.set(roomKey, []);
+            }
+            roomScheduleMap.get(roomKey).push({
+              timetableId: timetable._id,
+              timetableName: timetable.name || `${timetable._id}`,
+              entryId: entry._id,
+              course: entry.courseAllocation?.course?.code || "Unknown",
+              room: entry.room,
+              day: entry.day,
+              timeSlot: entry.timeSlot,
+            });
+          }
+        }
+      }
 
+      // Second pass: Detect conflicts (any key with more than one entry)
+      for (const [teacherKey, entries] of teacherScheduleMap.entries()) {
+        if (entries.length > 1) {
+          // Teacher conflict detected
+          const [teacherId, day, timeSlotId] = teacherKey.split("-");
+          const conflictId = `teacher-${teacherKey}`;
+
+          if (!conflictMap.has(conflictId)) {
+            const teacher = entries[0].teacher;
+            const timeSlot = entries[0].timeSlot;
+
+            const conflictData = {
+              type: "teacher_conflict",
+              conflictType: "teacher_schedule",
+              severity: "critical",
+              description: `Teacher ${teacher.name} has ${entries.length} overlapping classes on ${day} at ${timeSlot.name || timeSlot.timeRange}`,
+              timetable: entries[0].timetableId,
+              timetableName: entries[0].timetableName,
+              day: day,
+              timeSlot: timeSlot.name || timeSlot.timeRange,
+              teacher: teacher._id,
+              teacherName: teacher.name,
+              teacherEmail: teacher.email,
+              course: entries[0].course,
+              existingCourse: entries[1]?.course || "Unknown",
+              detectionSource: source,
+              detectionMethod: "cross_timetable_check",
+              status: "detected",
+              detectedBy: userId,
+              firstDetectedAt: new Date(),
+              lastDetectedAt: new Date(),
+              scheduleEntries: entries.map((e) => ({
+                entry: e.entryId,
+                timetable: e.timetableId,
+                day: e.day,
+                timeSlot: e.timeSlot._id,
+                courseAllocation: e.entryId, // This might need adjustment
+                room: null,
+              })),
+            };
+
+            // Add row numbers if available
+            const rowsWithConflicts = [];
+            for (const entry of entries) {
+              const rowNum = rowMap.get(entry.entryId?.toString());
+              if (rowNum) rowsWithConflicts.push(rowNum);
+            }
+
+            conflictMap.set(conflictId, conflictData);
+            conflicts.push({
+              ...conflictData,
+              rows: rowsWithConflicts.length > 0 ? rowsWithConflicts : [0],
+            });
+
+            bulkOps.push(this.createConflictBulkOp(conflictData));
+          }
+        }
+      }
+
+      for (const [roomKey, entries] of roomScheduleMap.entries()) {
+        if (entries.length > 1) {
+          // Room conflict detected
+          const [roomId, day, timeSlotId] = roomKey.split("-");
+          const conflictId = `room-${roomKey}`;
+
+          if (!conflictMap.has(conflictId)) {
+            const room = entries[0].room;
+            const timeSlot = entries[0].timeSlot;
+
+            const conflictData = {
+              type: "room_conflict",
+              conflictType: "room_occupancy",
+              severity: "high",
+              description: `Room ${room.roomNumber || room.code} is double-booked ${entries.length} times on ${day} at ${timeSlot.name || timeSlot.timeRange}`,
+              timetable: entries[0].timetableId,
+              timetableName: entries[0].timetableName,
+              day: day,
+              timeSlot: timeSlot.name || timeSlot.timeRange,
+              room: room._id,
+              roomNumber: room.roomNumber || room.code,
+              course: entries[0].course,
+              existingCourse: entries[1]?.course || "Unknown",
+              teacher: entries[0].teacher?._id,
+              teacherName: entries[0].teacher?.name,
+              detectionSource: source,
+              detectionMethod: "cross_timetable_check",
+              status: "detected",
+              detectedBy: userId,
+              firstDetectedAt: new Date(),
+              lastDetectedAt: new Date(),
+              scheduleEntries: entries.map((e) => ({
+                entry: e.entryId,
+                timetable: e.timetableId,
+                day: e.day,
+                timeSlot: e.timeSlot._id,
+                courseAllocation: e.entryId,
+                room: room._id,
+              })),
+            };
+
+            // Add row numbers if available
+            const rowsWithConflicts = [];
+            for (const entry of entries) {
+              const rowNum = rowMap.get(entry.entryId?.toString());
+              if (rowNum) rowsWithConflicts.push(rowNum);
+            }
+
+            conflictMap.set(conflictId, conflictData);
+            conflicts.push({
+              ...conflictData,
+              rows: rowsWithConflicts.length > 0 ? rowsWithConflicts : [0],
+            });
+
+            bulkOps.push(this.createConflictBulkOp(conflictData));
+          }
+        }
+      }
+
+      // Bulk insert all conflicts at once
+      if (bulkOps.length > 0) {
+        try {
+          const result = await Conflict.bulkWrite(bulkOps, { ordered: false });
+          console.log(`Created ${result.insertedCount} conflicts in database`);
+        } catch (bulkError) {
+          console.error("Bulk write error:", bulkError);
+          // Fallback: insert one by one
+          for (const conflictData of conflicts) {
+            try {
               const conflict = new Conflict(conflictData);
               await conflict.save();
-              conflicts.push(conflict);
-            } else {
-              roomSchedule[roomKey] = true;
+            } catch (singleError) {
+              console.error(
+                "Error saving individual conflict:",
+                singleError.message,
+              );
             }
           }
         }
       }
 
-      console.log(
-        `Conflict detection completed: ${conflicts.length} conflicts found`,
-      );
+      // Format conflicts for frontend response
+      const formattedConflicts = conflicts.map((conflict) => ({
+        type: conflict.type,
+        row: conflict.rows && conflict.rows.length > 0 ? conflict.rows[0] : 0,
+        allRows: conflict.rows || [],
+        teacher: conflict.teacherName || conflict.teacherEmail,
+        room: conflict.roomNumber,
+        day: conflict.day,
+        timeSlot: conflict.timeSlot,
+        message: conflict.description,
+        severity: conflict.severity,
+        conflicts: conflict.scheduleEntries.map((entry, idx) => ({
+          day: conflict.day,
+          timeSlot: conflict.timeSlot,
+          existingCourse: idx === 0 ? conflict.course : conflict.existingCourse,
+          message: conflict.description,
+          timetableName: conflict.timetableName,
+        })),
+      }));
+
+      console.log(`Returning ${formattedConflicts.length} formatted conflicts`);
+      return formattedConflicts;
     } catch (error) {
       console.error("Error in conflict detection engine:", error);
       throw error;
     }
+  }
 
-    return conflicts;
+  createConflictBulkOp(conflictData) {
+    return {
+      insertOne: {
+        document: {
+          type: conflictData.type,
+          conflictType: conflictData.conflictType,
+          severity: conflictData.severity,
+          description: conflictData.description,
+          timetable: conflictData.timetable,
+          day: conflictData.day,
+          timeSlot: conflictData.timeSlot,
+          teacher: conflictData.teacher,
+          room: conflictData.room,
+          course: conflictData.course,
+          existingCourse: conflictData.existingCourse,
+          detectionSource: conflictData.detectionSource,
+          detectionMethod: conflictData.detectionMethod,
+          status: conflictData.status,
+          detectedBy: conflictData.detectedBy,
+          firstDetectedAt: conflictData.firstDetectedAt,
+          lastDetectedAt: conflictData.lastDetectedAt,
+          scheduleEntries: conflictData.scheduleEntries.map((e) => ({
+            entry: e.entry,
+            timetable: e.timetable,
+            day: e.day,
+            timeSlot: e.timeSlot,
+            courseAllocation: e.courseAllocation,
+            room: e.room,
+          })),
+        },
+      },
+    };
+  }
+
+  // Helper method to extract row numbers (if stored)
+  async getConflictsWithRowNumbers(uploadId) {
+    try {
+      // Find conflicts related to this upload
+      const conflicts = await Conflict.find({
+        detectionSource: `csv_upload_${uploadId}`,
+      })
+        .populate("teacher", "name email")
+        .populate("room", "roomNumber code")
+        .lean();
+
+      // Try to get row numbers from the upload's success data
+      const upload = await CSVUpload.findById(uploadId).lean();
+
+      if (upload && upload.successData) {
+        // Create a map of recordId to row number
+        const rowMap = new Map();
+        upload.successData.forEach((item) => {
+          if (item.recordId) {
+            rowMap.set(item.recordId.toString(), item.row);
+          }
+        });
+
+        // Add row numbers to conflicts
+        return conflicts.map((conflict) => {
+          let rows = [];
+          // Try to find row number from schedule entries
+          if (conflict.scheduleEntries && conflict.scheduleEntries.length > 0) {
+            for (const entry of conflict.scheduleEntries) {
+              if (rowMap.has(entry.entry?.toString())) {
+                rows.push(rowMap.get(entry.entry.toString()));
+              }
+            }
+          }
+
+          return {
+            type:
+              conflict.type === "teacher_schedule"
+                ? "teacher_conflict"
+                : conflict.type,
+            row: rows.length > 0 ? rows[0] : 0,
+            allRows: rows,
+            teacher: conflict.teacher?.name || conflict.teacher?.email,
+            room: conflict.room?.roomNumber || conflict.room?.code,
+            day: conflict.day,
+            timeSlot: conflict.timeSlot,
+            message: conflict.description,
+            severity: conflict.severity,
+            conflicts: [
+              {
+                day: conflict.day,
+                timeSlot: conflict.timeSlot,
+                existingCourse: conflict.existingCourse,
+                message: conflict.description,
+              },
+            ],
+          };
+        });
+      }
+
+      return [];
+    } catch (error) {
+      console.error("Error getting conflicts with row numbers:", error);
+      return [];
+    }
   }
 }
 
-// Create instance
-const conflictDetectionEngine = new ConflictDetectionEngine();
-
 class CSVProcessorService {
   constructor() {
-    // Use temp directory for temporary files instead of persistent storage
-    this.tempDir = path.join(os.tmpdir(), "csv-uploads");
     this.resultsDir = path.join(os.tmpdir(), "csv-results");
 
-    // Create temp directories if they don't exist
-    if (!fs.existsSync(this.tempDir)) {
-      fs.mkdirSync(this.tempDir, { recursive: true });
-    }
     if (!fs.existsSync(this.resultsDir)) {
       fs.mkdirSync(this.resultsDir, { recursive: true });
     }
 
-    // Define CSV templates for each upload type
     this.templates = {
-      course_allocations: {
-        columns: [
-          "academic_session_code",
-          "semester",
-          "program_code",
-          "course_code",
-          "teacher_email",
-          "section_code",
-          "credit_hours",
-          "contact_hours_per_week",
-          "max_students",
-          "is_lab",
-          "lab_teacher_email",
-          "notes",
-        ],
-        required: [
-          "academic_session_code",
-          "semester",
-          "program_code",
-          "course_code",
-          "teacher_email",
-          "section_code",
-        ],
-        description:
-          "Bulk course allocations for assigning teachers to courses",
-      },
-      timetable_entries: {
-        columns: [
-          "timetable_name",
-          "day",
-          "time_slot_name",
-          "course_code",
-          "teacher_email",
-          "section_code",
-          "room_code",
-          "notes",
-        ],
-        required: [
-          "timetable_name",
-          "day",
-          "time_slot_name",
-          "course_code",
-          "teacher_email",
-          "section_code",
-        ],
-        description: "Bulk timetable schedule entries",
-      },
       schedule_entries: {
         columns: [
           "academic_session_code",
@@ -226,83 +416,65 @@ class CSVProcessorService {
         ],
         description: "Bulk schedule entries for timetables",
       },
-      teachers: {
-        columns: [
-          "name",
-          "email",
-          "employee_id",
-          "department_code",
-          "designation",
-          "qualification",
-          "specialization",
-          "max_weekly_hours",
-          "is_active",
-        ],
-        required: ["name", "email", "employee_id", "department_code"],
-        description: "Bulk teacher registration",
-      },
-      rooms: {
-        columns: [
-          "code",
-          "name",
-          "type",
-          "building",
-          "floor",
-          "capacity",
-          "resources",
-          "is_active",
-        ],
-        required: ["code", "name", "type", "capacity"],
-        description: "Bulk room/lab registration",
-      },
     };
 
-    // Export conflictDetectionEngine
-    this.conflictDetectionEngine = conflictDetectionEngine;
+    this.conflictDetectionEngine = new ConflictDetectionEngine();
   }
 
-  // Main processing method - UPDATED with Cloudinary
+  // Main processing method - OPTIMIZED
   async processCSV(fileData, uploadType, userId, options = {}) {
     console.log(`Processing CSV upload: ${uploadType}, User: ${userId}`);
 
-    // Upload to Cloudinary first
-    let cloudinaryResult;
-    try {
-      const folder = `schools/csv-uploads/${uploadType}/${userId}`;
-      cloudinaryResult = await uploadToCloudinary(
-        fileData.buffer,
-        folder,
-        fileData.originalname,
-      );
-      console.log(`File uploaded to Cloudinary: ${cloudinaryResult.public_id}`);
-    } catch (cloudinaryError) {
-      console.error("Cloudinary upload error:", cloudinaryError);
-      return {
-        success: false,
-        error: `Failed to upload file to cloud storage: ${cloudinaryError.message}`,
-      };
-    }
-
-    // Create upload record with Cloudinary info
+    // Create upload record
     const uploadRecord = await this.createUploadRecord(
       fileData,
       uploadType,
       userId,
-      cloudinaryResult,
       options,
     );
 
     try {
-      // Start processing
       await this.updateUploadStatus(uploadRecord._id, "processing", 0);
 
-      const results = await this.processFile(uploadRecord, uploadType, options);
+      // Parse CSV once
+      const rows = await this.parseCSVBuffer(fileData.buffer);
 
-      // Generate result files (temporary files)
+      // Pre-load all reference data
+      const referenceData = await this.loadReferenceData(rows);
+
+      // Process all rows with optimized batch operations
+      const results = await this.processRowsBatch(
+        rows,
+        uploadRecord,
+        uploadType,
+        userId,
+        referenceData,
+      );
+
+      // Generate result files
       const resultFiles = await this.generateResultFiles(uploadRecord, results);
 
-      // Update upload record with results
       await this.finalizeUpload(uploadRecord._id, results, resultFiles);
+
+      // Run conflict detection for processed timetables WITH ROW MAPPING
+      if (
+        results.processedTimetableIds &&
+        results.processedTimetableIds.size > 0
+      ) {
+        console.log(
+          `Running conflict detection for ${results.processedTimetableIds.size} timetables`,
+        );
+        const conflicts =
+          await this.conflictDetectionEngine.detectConflictsForUpload(
+            Array.from(results.processedTimetableIds),
+            userId,
+            `csv_upload_${uploadRecord._id}`,
+            uploadRecord._id, // Pass uploadId for row mapping
+          );
+
+        // Store conflicts in results
+        results.conflicts = conflicts;
+      }
 
       return {
         success: true,
@@ -313,7 +485,6 @@ class CSVProcessorService {
     } catch (error) {
       console.error("Error processing CSV:", error);
 
-      // Update upload record with failure
       await CSVUpload.findByIdAndUpdate(uploadRecord._id, {
         status: "failed",
         progress: 0,
@@ -329,159 +500,278 @@ class CSVProcessorService {
     }
   }
 
-  // Create upload record in database - UPDATED with Cloudinary
-  async createUploadRecord(
-    fileData,
-    uploadType,
-    userId,
-    cloudinaryResult,
-    options,
-  ) {
-    // We don't save file locally anymore, just use Cloudinary
-    const filename = `${Date.now()}-${fileData.originalname}`;
-
-    const uploadRecord = new CSVUpload({
-      uploadType,
-      filename,
-      originalName: fileData.originalname,
-      fileSize: fileData.size,
-      filePath: null, // Set to null since we're using Cloudinary
-      mimeType: fileData.mimetype,
-      // Cloudinary fields
-      cloudinaryId: cloudinaryResult.public_id,
-      cloudinaryUrl: cloudinaryResult.secure_url,
-      cloudinaryFolder: cloudinaryResult.folder,
-      uploadedBy: userId,
-      academicSession: options.academicSession || null,
-      semester: options.semester || null,
-      program: options.program || null,
-      validationRules: this.templates[uploadType] || {},
-      templateUsed: options.template || "default",
-      templateVersion: "1.0",
-      status: "uploaded",
-    });
-
-    await uploadRecord.save();
-    console.log(
-      `Created upload record: ${uploadRecord._id} with Cloudinary ID: ${cloudinaryResult.public_id}`,
-    );
-    return uploadRecord;
-  }
-
-  // Process CSV file based on type - UPDATED to use buffer parsing
-  async processFile(uploadRecord, uploadType, options) {
-    const results = {
-      total: 0,
-      successful: 0,
-      failed: 0,
-      errors: [],
-      successes: [],
-    };
-
+  // Parse CSV buffer once
+  async parseCSVBuffer(buffer) {
     const rows = [];
-
-    // Get file from Cloudinary
-    let fileBuffer;
-    try {
-      fileBuffer = await downloadFromCloudinary(uploadRecord.cloudinaryUrl);
-    } catch (error) {
-      throw new Error(
-        `Failed to download file from Cloudinary: ${error.message}`,
-      );
-    }
-
-    // Parse CSV from buffer (not from file path)
     await new Promise((resolve, reject) => {
       const bufferStream = new stream.PassThrough();
-      bufferStream.end(fileBuffer);
+      bufferStream.end(buffer);
 
       bufferStream
         .pipe(csv())
         .on("data", (row) => {
-          rows.push(row);
+          // Clean row data once
+          const cleanedRow = {};
+          Object.keys(row).forEach((key) => {
+            cleanedRow[key.trim()] =
+              typeof row[key] === "string" ? row[key].trim() : row[key];
+          });
+          rows.push(cleanedRow);
         })
-        .on("end", () => {
-          resolve();
-        })
-        .on("error", (error) => {
-          reject(error);
+        .on("end", resolve)
+        .on("error", reject);
+    });
+    return rows;
+  }
+
+  // Pre-load all reference data in parallel
+  async loadReferenceData(rows) {
+    console.log("Pre-loading reference data...");
+
+    // Extract unique values from all rows
+    const uniqueValues = {
+      sessionCodes: new Set(),
+      programCodes: new Set(),
+      courseCodes: new Set(),
+      teacherEmails: new Set(),
+      timeSlotNames: new Set(),
+      roomCodes: new Set(),
+      semesterNumbers: new Set(),
+      sectionKeys: new Map(),
+    };
+
+    rows.forEach((row) => {
+      if (row.academic_session_code)
+        uniqueValues.sessionCodes.add(row.academic_session_code.trim());
+      if (row.program_code)
+        uniqueValues.programCodes.add(row.program_code.trim());
+      if (row.course_code) uniqueValues.courseCodes.add(row.course_code.trim());
+      if (row.teacher_email)
+        uniqueValues.teacherEmails.add(row.teacher_email.trim().toLowerCase());
+      if (row.time_slot_name)
+        uniqueValues.timeSlotNames.add(row.time_slot_name.trim());
+      if (row.room_code)
+        uniqueValues.roomCodes.add(row.room_code.trim().toUpperCase());
+      if (row.semester)
+        uniqueValues.semesterNumbers.add(parseInt(row.semester));
+
+      if (
+        row.academic_session_code &&
+        row.program_code &&
+        row.semester &&
+        row.section_code
+      ) {
+        const key = `${row.academic_session_code.trim()}|${row.program_code.trim()}|${row.semester}|${row.section_code.trim()}`;
+        uniqueValues.sectionKeys.set(key, {
+          sessionCode: row.academic_session_code.trim(),
+          programCode: row.program_code.trim(),
+          semester: parseInt(row.semester),
+          sectionCode: row.section_code.trim(),
         });
+      }
     });
 
-    results.total = rows.length;
-    console.log(
-      `Processing ${rows.length} rows for upload ${uploadRecord._id}`,
-    );
+    // Load all data in parallel
+    const [
+      sessions,
+      programs,
+      courses,
+      teachers,
+      timeSlots,
+      rooms,
+      semesters,
+      existingSections,
+      existingAllocations,
+      existingTimetables,
+    ] = await Promise.all([
+      AcademicSession.find({
+        $or: [
+          { code: { $in: Array.from(uniqueValues.sessionCodes) } },
+          { name: { $in: Array.from(uniqueValues.sessionCodes) } },
+        ],
+      }).lean(),
 
-    // Get upload user for createdBy fields
-    const uploadUser = await this.getUploadUser(uploadRecord._id);
+      Program.find({
+        code: { $in: Array.from(uniqueValues.programCodes) },
+      }).lean(),
 
-    // Track timetable IDs for post-upload conflict detection
-    const processedTimetableIds = new Set();
+      Course.find({
+        $or: [
+          { code: { $in: Array.from(uniqueValues.courseCodes) } },
+          { courseCode: { $in: Array.from(uniqueValues.courseCodes) } },
+        ],
+      }).lean(),
 
-    // Process rows based on upload type
+      User.find({
+        email: { $in: Array.from(uniqueValues.teacherEmails) },
+        role: "Teacher",
+      }).lean(),
+
+      TimeSlot.find({
+        $or: [
+          { name: { $in: Array.from(uniqueValues.timeSlotNames) } },
+          { timeRange: { $in: Array.from(uniqueValues.timeSlotNames) } },
+        ],
+        isActive: true,
+      }).lean(),
+
+      Room.find({
+        $or: [
+          { roomNumber: { $in: Array.from(uniqueValues.roomCodes) } },
+          { code: { $in: Array.from(uniqueValues.roomCodes) } },
+        ],
+        isAvailable: true,
+      }).lean(),
+
+      mongoose
+        .model("Semester")
+        .find({
+          $or: [
+            { number: { $in: Array.from(uniqueValues.semesterNumbers) } },
+            {
+              semesterNumber: { $in: Array.from(uniqueValues.semesterNumbers) },
+            },
+          ],
+        })
+        .lean(),
+
+      Section.find().lean(),
+
+      CourseAllocation.find({
+        status: { $in: ["approved", "active", "draft"] },
+      }).lean(),
+
+      Timetable.find({
+        status: { $ne: "archived" },
+      }).lean(),
+    ]);
+
+    // Create lookup maps for O(1) access
+    const sessionMap = new Map();
+    sessions.forEach((s) => {
+      sessionMap.set(s.code, s);
+      if (s.name) sessionMap.set(s.name, s);
+    });
+
+    const programMap = new Map(programs.map((p) => [p.code, p]));
+
+    const courseMap = new Map();
+    courses.forEach((c) => {
+      courseMap.set(c.code, c);
+      if (c.courseCode) courseMap.set(c.courseCode, c);
+    });
+
+    const teacherMap = new Map(teachers.map((t) => [t.email.toLowerCase(), t]));
+
+    const timeSlotMap = new Map();
+    timeSlots.forEach((ts) => {
+      timeSlotMap.set(ts.name, ts);
+      if (ts.timeRange) timeSlotMap.set(ts.timeRange, ts);
+      if (ts.code) timeSlotMap.set(ts.code, ts);
+    });
+
+    const roomMap = new Map();
+    rooms.forEach((r) => {
+      roomMap.set(r.roomNumber, r);
+      if (r.code) roomMap.set(r.code, r);
+    });
+
+    const semesterMap = new Map();
+    semesters.forEach((s) => {
+      const key = `${s.academicSession}|${s.number || s.semesterNumber}`;
+      semesterMap.set(key, s);
+    });
+
+    const sectionMap = new Map();
+    existingSections.forEach((s) => {
+      const key = `${s.academicSession}|${s.program}|${s.semester}|${s.code}`;
+      sectionMap.set(key, s);
+    });
+
+    const allocationMap = new Map();
+    existingAllocations.forEach((a) => {
+      const key = `${a.academicSession}|${a.semester}|${a.program}|${a.course}|${a.teacher}|${a.section}`;
+      allocationMap.set(key, a);
+    });
+
+    const timetableMap = new Map();
+    existingTimetables.forEach((t) => {
+      const key = `${t.academicSession}|${t.semester}|${t.program}|${t.section}`;
+      timetableMap.set(key, t);
+    });
+
+    return {
+      sessionMap,
+      programMap,
+      courseMap,
+      teacherMap,
+      timeSlotMap,
+      roomMap,
+      semesterMap,
+      sectionMap,
+      allocationMap,
+      timetableMap,
+      sessions,
+      programs,
+      courses,
+      teachers,
+      timeSlots,
+      rooms,
+      semesters,
+      existingSections,
+      existingAllocations,
+      existingTimetables,
+    };
+  }
+
+  // Process all rows in batches with minimal database operations
+  async processRowsBatch(
+    rows,
+    uploadRecord,
+    uploadType,
+    userId,
+    referenceData,
+  ) {
+    const results = {
+      total: rows.length,
+      successful: 0,
+      failed: 0,
+      errors: [],
+      successes: [],
+      processedTimetableIds: new Set(),
+    };
+
+    // Prepare bulk operations
+    const timetableBulkOps = [];
+    const allocationBulkOps = [];
+    const sectionBulkOps = [];
+    const semesterBulkOps = [];
+    const timeSlotBulkOps = [];
+
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
       const rowNumber = i + 1;
 
-      // Update progress
-      const progress = Math.floor(((i + 1) / rows.length) * 100);
-      await this.updateUploadStatus(uploadRecord._id, "processing", progress);
-
       try {
-        // Validate row
-        await this.validateRow(row, uploadType, rowNumber, uploadRecord._id);
+        // Validate row using reference data
+        this.validateRowWithData(row, uploadType, rowNumber, referenceData);
 
-        // Process based on type
-        let result;
-        switch (uploadType) {
-          case "course_allocations":
-            result = await this.processCourseAllocation(
-              row,
-              uploadRecord._id,
-              rowNumber,
-              uploadUser,
-            );
-            break;
-          case "timetable_entries":
-            result = await this.processTimetableEntry(
-              row,
-              uploadRecord._id,
-              rowNumber,
-              uploadUser,
-            );
-            break;
-          case "schedule_entries":
-            result = await this.processScheduleEntry(
-              row,
-              uploadRecord._id,
-              rowNumber,
-              uploadUser,
-            );
-            // Track timetable ID for conflict detection
-            if (result && result.timetableId) {
-              processedTimetableIds.add(result.timetableId);
-            }
-            break;
-          case "teachers":
-            result = await this.processTeacher(
-              row,
-              uploadRecord._id,
-              rowNumber,
-              uploadUser,
-            );
-            break;
-          case "rooms":
-            result = await this.processRoom(
-              row,
-              uploadRecord._id,
-              rowNumber,
-              uploadUser,
-            );
-            break;
-          default:
-            throw new Error(`Unsupported upload type: ${uploadType}`);
-        }
+        // Process schedule entry with cached data
+        const result = await this.processScheduleEntryOptimized(
+          row,
+          uploadRecord._id,
+          rowNumber,
+          userId,
+          referenceData,
+          {
+            timetableBulkOps,
+            allocationBulkOps,
+            sectionBulkOps,
+            semesterBulkOps,
+            timeSlotBulkOps,
+            processedTimetableIds: results.processedTimetableIds,
+          },
+        );
 
         results.successful++;
         results.successes.push({
@@ -490,13 +780,9 @@ class CSVProcessorService {
           result,
         });
 
-        // Add success to upload record
         await this.addSuccessToUpload(
           uploadRecord._id,
-          result.recordId ||
-            result.allocationId ||
-            result.teacherId ||
-            result.roomId,
+          result.recordId || new mongoose.Types.ObjectId(),
           rowNumber,
           `Processed row ${rowNumber} successfully`,
         );
@@ -508,7 +794,6 @@ class CSVProcessorService {
           error: error.message,
         });
 
-        // Add error to upload record
         await this.addErrorToUpload(
           uploadRecord._id,
           rowNumber,
@@ -518,25 +803,250 @@ class CSVProcessorService {
           error.message,
         );
       }
+
+      // Update progress every 10 rows
+      if (i % 10 === 0) {
+        const progress = Math.floor((i / rows.length) * 100);
+        await this.updateUploadStatus(uploadRecord._id, "processing", progress);
+      }
     }
 
-    // Run post-upload conflict detection for schedule entries
-    if (uploadType === "schedule_entries" && processedTimetableIds.size > 0) {
-      console.log(
-        `Running conflict detection for ${processedTimetableIds.size} timetables`,
-      );
-      await this.runPostUploadConflictDetection(
-        Array.from(processedTimetableIds),
-        uploadRecord._id,
-        uploadUser,
+    // Execute all bulk operations in parallel
+    const bulkPromises = [];
+    if (semesterBulkOps.length > 0) {
+      bulkPromises.push(
+        mongoose
+          .model("Semester")
+          .bulkWrite(semesterBulkOps, { ordered: false }),
       );
     }
+    if (timeSlotBulkOps.length > 0) {
+      bulkPromises.push(
+        TimeSlot.bulkWrite(timeSlotBulkOps, { ordered: false }),
+      );
+    }
+    if (sectionBulkOps.length > 0) {
+      bulkPromises.push(Section.bulkWrite(sectionBulkOps, { ordered: false }));
+    }
+    if (allocationBulkOps.length > 0) {
+      bulkPromises.push(
+        CourseAllocation.bulkWrite(allocationBulkOps, { ordered: false }),
+      );
+    }
+    if (timetableBulkOps.length > 0) {
+      bulkPromises.push(
+        Timetable.bulkWrite(timetableBulkOps, { ordered: false }),
+      );
+    }
+
+    await Promise.all(bulkPromises);
 
     return results;
   }
 
-  // Validate CSV row (unchanged - keep as is)
-  async validateRow(row, uploadType, rowNumber, uploadId = null) {
+  // Optimized schedule entry processor using cached data and bulk operations
+  async processScheduleEntryOptimized(
+    row,
+    uploadId,
+    rowNumber,
+    userId,
+    refData,
+    bulkOps,
+  ) {
+    // Get references from maps (O(1) lookups)
+    const session = refData.sessionMap.get(row.academic_session_code);
+    if (!session)
+      throw new Error(
+        `Academic session not found: ${row.academic_session_code}`,
+      );
+
+    const program = refData.programMap.get(row.program_code);
+    if (!program) throw new Error(`Program not found: ${row.program_code}`);
+
+    const course = refData.courseMap.get(row.course_code);
+    if (!course) throw new Error(`Course not found: ${row.course_code}`);
+
+    const teacher = refData.teacherMap.get(row.teacher_email.toLowerCase());
+    if (!teacher) throw new Error(`Teacher not found: ${row.teacher_email}`);
+
+    let timeSlot = refData.timeSlotMap.get(row.time_slot_name);
+    if (!timeSlot) {
+      // Create time slot via bulk operation if not exists
+      const newTimeSlot = {
+        name: row.time_slot_name,
+        timeRange: row.time_slot_name,
+        startTime: row.time_slot_name.split("-")[0]?.trim() || "00:00",
+        endTime: row.time_slot_name.split("-")[1]?.trim() || "01:00",
+        durationMinutes: 60,
+        isActive: true,
+      };
+
+      const tempId = new mongoose.Types.ObjectId();
+      bulkOps.timeSlotBulkOps.push({
+        insertOne: { document: newTimeSlot },
+      });
+
+      // Use temporary ID for now
+      timeSlot = { _id: tempId, name: newTimeSlot.name };
+    }
+
+    const semesterNum = parseInt(row.semester);
+    const semesterKey = `${session._id}|${semesterNum}`;
+    let semester = refData.semesterMap.get(semesterKey);
+
+    if (!semester) {
+      // Create semester via bulk operation
+      const newSemester = {
+        name: `Semester ${semesterNum}`,
+        number: semesterNum,
+        semesterNumber: semesterNum,
+        academicSession: session._id,
+        isActive: true,
+      };
+
+      const tempId = new mongoose.Types.ObjectId();
+      bulkOps.semesterBulkOps.push({
+        insertOne: { document: newSemester },
+      });
+
+      semester = { _id: tempId };
+    }
+
+    const sectionKey = `${session._id}|${program._id}|${semester._id}|${row.section_code}`;
+    let section = refData.sectionMap.get(sectionKey);
+
+    if (!section) {
+      // Create section via bulk operation
+      const newSection = {
+        code: row.section_code,
+        name: `Section ${row.section_code}`,
+        program: program._id,
+        semester: semester._id,
+        academicSession: session._id,
+        maxStudents: 50,
+      };
+
+      const tempId = new mongoose.Types.ObjectId();
+      bulkOps.sectionBulkOps.push({
+        insertOne: { document: newSection },
+      });
+
+      section = { _id: tempId, code: newSection.code };
+    }
+
+    const allocationKey = `${session._id}|${semesterNum}|${program._id}|${course._id}|${teacher._id}|${section._id}`;
+    let allocation = refData.allocationMap.get(allocationKey);
+
+    if (!allocation) {
+      // Create allocation via bulk operation
+      const newAllocation = {
+        academicSession: session._id,
+        semester: semesterNum,
+        program: program._id,
+        course: course._id,
+        teacher: teacher._id,
+        section: section._id,
+        creditHours: course.creditHours || 3,
+        contactHoursPerWeek: course.contactHours || 3,
+        maxStudents: course.maxStudents || 50,
+        isLab:
+          course.courseType === "Lab" || course.courseType === "Theory+Lab",
+        status: "draft",
+        createdBy: userId,
+      };
+
+      const tempId = new mongoose.Types.ObjectId();
+      bulkOps.allocationBulkOps.push({
+        insertOne: { document: newAllocation },
+      });
+
+      allocation = { _id: tempId };
+    }
+
+    const timetableKey = `${session._id}|${semesterNum}|${program._id}|${section._id}`;
+    let timetable = refData.timetableMap.get(timetableKey);
+
+    const room = row.room_code
+      ? refData.roomMap.get(row.room_code.toUpperCase())
+      : null;
+
+    let timetableId;
+    if (!timetable) {
+      // Create timetable via bulk operation
+      timetableId = new mongoose.Types.ObjectId();
+      const newTimetable = {
+        _id: timetableId,
+        name: `${program.code} - Sem ${semesterNum} - ${section.code}`,
+        academicSession: session._id,
+        semester: semesterNum,
+        program: program._id,
+        section: section._id,
+        schedule: [
+          {
+            _id: new mongoose.Types.ObjectId(),
+            day: row.day,
+            timeSlot: timeSlot._id,
+            courseAllocation: allocation._id,
+            room: room ? room._id : null,
+            notes: row.notes || "",
+            createdBy: userId,
+            createdAt: new Date(),
+          },
+        ],
+        status: "draft",
+        createdBy: userId,
+      };
+
+      bulkOps.timetableBulkOps.push({
+        insertOne: { document: newTimetable },
+      });
+
+      // Add to timetableMap for future rows
+      refData.timetableMap.set(timetableKey, { _id: timetableId });
+    } else {
+      timetableId = timetable._id;
+      // Add schedule entry to existing timetable
+      const scheduleEntryId = new mongoose.Types.ObjectId();
+      const updateOp = {
+        updateOne: {
+          filter: { _id: timetable._id },
+          update: {
+            $push: {
+              schedule: {
+                _id: scheduleEntryId,
+                day: row.day,
+                timeSlot: timeSlot._id,
+                courseAllocation: allocation._id,
+                room: room ? room._id : null,
+                notes: row.notes || "",
+                createdBy: userId,
+                createdAt: new Date(),
+              },
+            },
+          },
+        },
+      };
+      bulkOps.timetableBulkOps.push(updateOp);
+    }
+
+    // Track timetable ID for conflict detection
+    bulkOps.processedTimetableIds.add(timetableId.toString());
+
+    return {
+      action: timetable ? "updated" : "created",
+      recordId: timetableId,
+      timetable:
+        timetable?.name ||
+        `${program.code} - Sem ${semesterNum} - ${section.code}`,
+      day: row.day,
+      timeSlot: timeSlot.name || row.time_slot_name,
+      course: course.code,
+      teacher: teacher.email,
+      timetableId: timetableId,
+    };
+  }
+
+  validateRowWithData(row, uploadType, rowNumber, refData) {
     const template = this.templates[uploadType];
     if (!template) {
       throw new Error(`No template found for upload type: ${uploadType}`);
@@ -554,30 +1064,19 @@ class CSVProcessorService {
       }
     }
 
-    // Type-specific validation
-    switch (uploadType) {
-      case "course_allocations":
-        await this.validateCourseAllocationRow(row, rowNumber, uploadId);
-        break;
-      case "timetable_entries":
-        await this.validateTimetableEntryRow(row, rowNumber);
-        break;
-      case "schedule_entries":
-        await this.validateScheduleEntryRow(row, rowNumber, uploadId);
-        break;
-      case "teachers":
-        await this.validateTeacherRow(row, rowNumber);
-        break;
-      case "rooms":
-        await this.validateRoomRow(row, rowNumber);
-        break;
+    // Validate day
+    const validDays = [
+      "Monday",
+      "Tuesday",
+      "Wednesday",
+      "Thursday",
+      "Friday",
+      "Saturday",
+      "Sunday",
+    ];
+    if (!validDays.includes(row.day)) {
+      throw new Error(`Invalid day: ${row.day} in row ${rowNumber}`);
     }
-  }
-
-  // The rest of your validation methods (validateCourseAllocationRow, validateScheduleEntryRow, etc.)
-  // remain exactly the same - no changes needed
-  async validateCourseAllocationRow(row, rowNumber, uploadId) {
-    console.log(`Validating course allocation row ${rowNumber}`);
 
     // Validate semester
     const semester = parseInt(row.semester);
@@ -585,1469 +1084,92 @@ class CSVProcessorService {
       throw new Error(`Invalid semester: ${row.semester} in row ${rowNumber}`);
     }
 
-    // Validate academic session exists
-    const sessionCode = row.academic_session_code.trim();
-    const session = await AcademicSession.findOne({
-      $or: [{ code: sessionCode }, { name: sessionCode }],
-    });
-    if (!session) {
+    // Check if references exist in maps
+    if (!refData.sessionMap.has(row.academic_session_code)) {
       throw new Error(
-        `Academic session not found: ${row.academic_session_code} in row ${rowNumber}`,
+        `Academic session not found: ${row.academic_session_code}`,
       );
     }
 
-    // Validate program exists
-    const programCode = row.program_code.trim();
-    const program = await Program.findOne({ code: programCode });
-    if (!program) {
-      throw new Error(
-        `Program not found: ${row.program_code} in row ${rowNumber}`,
-      );
+    if (!refData.programMap.has(row.program_code)) {
+      throw new Error(`Program not found: ${row.program_code}`);
     }
 
-    // Validate course exists
-    const courseCode = row.course_code.trim();
-    const course = await Course.findOne({ code: courseCode });
-    if (!course) {
-      throw new Error(
-        `Course not found: ${row.course_code} in row ${rowNumber}`,
-      );
+    if (!refData.courseMap.has(row.course_code)) {
+      throw new Error(`Course not found: ${row.course_code}`);
     }
 
-    // Validate teacher exists
-    const teacherEmail = row.teacher_email.trim().toLowerCase();
-    const teacher = await User.findOne({
-      email: teacherEmail,
-      role: "Teacher",
-      status: "Approved",
-    });
-    if (!teacher) {
-      throw new Error(
-        `Teacher not found or not approved: ${row.teacher_email} in row ${rowNumber}`,
-      );
+    if (!refData.teacherMap.has(row.teacher_email.toLowerCase())) {
+      throw new Error(`Teacher not found: ${row.teacher_email}`);
     }
 
-    // Validate section exists
-    const sectionCode = row.section_code.trim();
-
-    // Find semester document by name or number
-    const semesterDoc = await mongoose.model("Semester").findOne({
-      $or: [
-        { name: `Semester ${semester}` },
-        { number: semester },
-        { semesterNumber: semester },
-      ],
-      academicSession: session._id,
-    });
-
-    if (!semesterDoc) {
-      throw new Error(
-        `Semester ${semester} not found for academic session in row ${rowNumber}`,
-      );
+    if (
+      !refData.timeSlotMap.has(row.time_slot_name) &&
+      !row.time_slot_name.includes("-")
+    ) {
+      throw new Error(`Time slot not found: ${row.time_slot_name}`);
     }
 
-    const section = await Section.findOne({
-      code: sectionCode,
-      program: program._id,
-      semester: semesterDoc._id,
-      academicSession: session._id,
-    });
-
-    if (!section) {
-      throw new Error(
-        `Section not found: ${row.section_code} for program ${row.program_code} and semester ${semester} in row ${rowNumber}`,
-      );
-    }
-
-    // Validate credit hours
-    if (row.credit_hours) {
-      const creditHours = parseInt(row.credit_hours);
-      if (isNaN(creditHours) || creditHours < 1 || creditHours > 5) {
-        throw new Error(
-          `Invalid credit hours: ${row.credit_hours} in row ${rowNumber}`,
-        );
-      }
-    }
-
-    // Validate contact hours
-    if (row.contact_hours_per_week) {
-      const contactHours = parseInt(row.contact_hours_per_week);
-      if (isNaN(contactHours) || contactHours < 1 || contactHours > 20) {
-        throw new Error(
-          `Invalid contact hours: ${row.contact_hours_per_week} in row ${rowNumber}`,
-        );
-      }
-    }
-
-    console.log(`✅ Course allocation row ${rowNumber} validation passed`);
-  }
-
-  async validateScheduleEntryRow(row, rowNumber, uploadId) {
-    console.log(`\n=== Validating Schedule Entry Row ${rowNumber} ===`);
-
-    // Validate day
-    const validDays = [
-      "Monday",
-      "Tuesday",
-      "Wednesday",
-      "Thursday",
-      "Friday",
-      "Saturday",
-      "Sunday",
-    ];
-
-    const day = row.day.trim();
-    if (!validDays.includes(day)) {
-      throw new Error(`Invalid day: ${row.day} in row ${rowNumber}`);
-    }
-
-    // Validate time slot
-    const timeSlotName = row.time_slot_name.trim();
-    const timeSlot = await TimeSlot.findOne({
-      $or: [{ name: timeSlotName }, { timeRange: timeSlotName }],
-      isActive: true,
-    });
-
-    if (!timeSlot) {
-      throw new Error(
-        `Time slot not found: ${row.time_slot_name} in row ${rowNumber}`,
-      );
-    }
-
-    // Validate academic session
-    const sessionCode = row.academic_session_code.trim();
-    const session = await AcademicSession.findOne({
-      $or: [{ code: sessionCode }, { name: sessionCode }],
-    });
-
-    if (!session) {
-      throw new Error(
-        `Academic session not found: ${row.academic_session_code} in row ${rowNumber}`,
-      );
-    }
-
-    // Validate program
-    const programCode = row.program_code.trim();
-    const program = await Program.findOne({ code: programCode });
-    if (!program) {
-      throw new Error(
-        `Program not found: ${row.program_code} in row ${rowNumber}`,
-      );
-    }
-
-    // Validate semester
-    const semesterNumber = parseInt(row.semester);
-    if (isNaN(semesterNumber) || semesterNumber < 1 || semesterNumber > 8) {
-      throw new Error(`Invalid semester: ${row.semester} in row ${rowNumber}`);
-    }
-
-    // Find semester document
-    const semesterDoc = await mongoose.model("Semester").findOne({
-      $or: [
-        { name: `Semester ${semesterNumber}` },
-        { number: semesterNumber },
-        { semesterNumber: semesterNumber },
-      ],
-      academicSession: session._id,
-    });
-
-    if (!semesterDoc) {
-      throw new Error(
-        `Semester ${semesterNumber} not found for academic session in row ${rowNumber}`,
-      );
-    }
-
-    // Validate section
-    const sectionCode = row.section_code.trim();
-    const section = await Section.findOne({
-      code: sectionCode,
-      program: program._id,
-      semester: semesterDoc._id,
-      academicSession: session._id,
-    });
-
-    if (!section) {
-      throw new Error(
-        `Section not found: ${row.section_code} for program ${row.program_code} in row ${rowNumber}`,
-      );
-    }
-
-    // Validate course
-    const courseCode = row.course_code.trim();
-    const course = await Course.findOne({ code: courseCode });
-    if (!course) {
-      throw new Error(
-        `Course not found: ${row.course_code} in row ${rowNumber}`,
-      );
-    }
-
-    // Validate teacher
-    const teacherEmail = row.teacher_email.trim().toLowerCase();
-    const teacher = await User.findOne({
-      email: teacherEmail,
-      role: "Teacher",
-      status: "Approved",
-    });
-
-    if (!teacher) {
-      throw new Error(
-        `Teacher not found or not approved: ${row.teacher_email} in row ${rowNumber}`,
-      );
-    }
-
-    console.log(`✅ Teacher found: ${teacher.name} (${teacher.email})`);
-
-    // Check or create course allocation
-    const allocation = await CourseAllocation.findOne({
-      academicSession: session._id,
-      semester: semesterNumber,
-      program: program._id,
-      course: course._id,
-      teacher: teacher._id,
-      section: section._id,
-      status: { $in: ["approved", "active", "draft"] },
-    });
-
-    if (!allocation) {
-      console.log("Creating automatic course allocation...");
-
-      // Get upload user for createdBy field
-      let createdByUser = null;
-      if (uploadId) {
-        const upload = await CSVUpload.findById(uploadId);
-        if (upload && upload.uploadedBy) {
-          createdByUser = upload.uploadedBy;
-        }
-      }
-
-      const newAllocation = new CourseAllocation({
-        academicSession: session._id,
-        semester: semesterNumber,
-        program: program._id,
-        course: course._id,
-        teacher: teacher._id,
-        section: section._id,
-        creditHours: course.creditHours || 3,
-        contactHoursPerWeek: course.contactHours || 3,
-        maxStudents: course.maxStudents || 50,
-        isLab:
-          course.courseType === "Lab" || course.courseType === "Theory+Lab",
-        status: "draft",
-        createdBy: createdByUser || teacher._id, // Fallback to teacher if no upload user
-      });
-
-      await newAllocation.save();
-      console.log(`✅ Created allocation: ${newAllocation._id}`);
-    } else {
-      console.log(`✅ Existing allocation found: ${allocation._id}`);
-    }
-
-    // Validate room if provided
-    if (row.room_code && row.room_code.trim()) {
-      const roomCode = row.room_code.trim();
-      const room = await Room.findOne({
-        roomNumber: roomCode,
-        isAvailable: true,
-      });
-
-      if (!room) {
-        throw new Error(`Room not found: ${row.room_code} in row ${rowNumber}`);
-      }
-    }
-
-    console.log(`=== Row ${rowNumber} validation passed ===\n`);
-  }
-
-  async validateTimetableEntryRow(row, rowNumber) {
-    console.log(`Validating timetable entry row ${rowNumber}`);
-
-    // Validate day
-    const validDays = [
-      "Monday",
-      "Tuesday",
-      "Wednesday",
-      "Thursday",
-      "Friday",
-      "Saturday",
-      "Sunday",
-    ];
-    const day = row.day.trim();
-    if (!validDays.includes(day)) {
-      throw new Error(`Invalid day: ${row.day} in row ${rowNumber}`);
-    }
-
-    // Validate timetable exists
-    const timetableName = row.timetable_name.trim();
-    const timetable = await Timetable.findOne({
-      name: timetableName,
-      status: { $ne: "archived" },
-    });
-    if (!timetable) {
-      throw new Error(
-        `Timetable not found: ${row.timetable_name} in row ${rowNumber}`,
-      );
-    }
-
-    // Validate time slot
-    const timeSlotName = row.time_slot_name.trim();
-    const timeSlot = await TimeSlot.findOne({
-      $or: [{ name: timeSlotName }, { timeRange: timeSlotName }],
-      isActive: true,
-    });
-    if (!timeSlot) {
-      throw new Error(
-        `Time slot not found: ${row.time_slot_name} in row ${rowNumber}`,
-      );
-    }
-
-    // Validate course
-    const courseCode = row.course_code.trim();
-    const course = await Course.findOne({ code: courseCode });
-    if (!course) {
-      throw new Error(
-        `Course not found: ${row.course_code} in row ${rowNumber}`,
-      );
-    }
-
-    // Validate teacher
-    const teacherEmail = row.teacher_email.trim().toLowerCase();
-    const teacher = await User.findOne({
-      email: teacherEmail,
-      role: "Teacher",
-    });
-    if (!teacher) {
-      throw new Error(
-        `Teacher not found: ${row.teacher_email} in row ${rowNumber}`,
-      );
-    }
-
-    // Validate section exists in this timetable
-    const sectionCode = row.section_code.trim();
-    if (timetable.section && timetable.section.code !== sectionCode) {
-      throw new Error(
-        `Section mismatch: Timetable has section ${timetable.section.code}, but row specifies ${sectionCode} in row ${rowNumber}`,
-      );
-    }
-
-    console.log(`✅ Timetable entry row ${rowNumber} validation passed`);
-  }
-
-  async validateTeacherRow(row, rowNumber) {
-    // Validate email
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(row.email)) {
-      throw new Error(`Invalid email: ${row.email} in row ${rowNumber}`);
-    }
-
-    // Check if email already exists
-    const existingUser = await User.findOne({
-      email: row.email.trim().toLowerCase(),
-    });
-    if (existingUser && existingUser.role === "Teacher") {
-      console.log(`Teacher ${row.email} already exists, will update`);
-    }
-
-    // Validate employee ID if provided
-    if (row.employee_id) {
-      const existingEmployee = await User.findOne({
-        employeeId: row.employee_id.trim(),
-        role: "Teacher",
-      });
-      if (
-        existingEmployee &&
-        existingEmployee.email !== row.email.trim().toLowerCase()
-      ) {
-        throw new Error(
-          `Employee ID already exists for another teacher: ${row.employee_id} in row ${rowNumber}`,
-        );
-      }
-    }
-
-    // Validate max weekly hours
-    if (row.max_weekly_hours) {
-      const maxHours = parseInt(row.max_weekly_hours);
-      if (isNaN(maxHours) || maxHours < 1 || maxHours > 40) {
-        throw new Error(
-          `Invalid max weekly hours: ${row.max_weekly_hours} in row ${rowNumber}`,
-        );
-      }
-    }
-
-    // Validate department exists
-    if (row.department_code) {
-      const department = await Department.findOne({
-        code: row.department_code.trim(),
-      });
-      if (!department) {
-        throw new Error(
-          `Department not found: ${row.department_code} in row ${rowNumber}`,
-        );
-      }
-    }
-  }
-
-  async validateRoomRow(row, rowNumber) {
-    // Validate capacity
-    const capacity = parseInt(row.capacity);
-    if (isNaN(capacity) || capacity < 1 || capacity > 500) {
-      throw new Error(`Invalid capacity: ${row.capacity} in row ${rowNumber}`);
-    }
-
-    // Validate type - match your Room model enum
-    const validTypes = [
-      "Lecture",
-      "Lab",
-      "Conference",
-      "Auditorium",
-      "Seminar",
-    ];
-    if (row.type && !validTypes.includes(row.type)) {
-      throw new Error(
-        `Invalid room type: ${row.type} in row ${rowNumber}. Valid types: ${validTypes.join(", ")}`,
-      );
-    }
-
-    // Check if room code already exists
-    if (row.code) {
-      const existingRoom = await Room.findOne({
-        roomNumber: row.code.trim().toUpperCase(),
-      });
-      if (existingRoom) {
-        throw new Error(
-          `Room code already exists: ${row.code} in row ${rowNumber}`,
-        );
-      }
-    }
-  }
-
-  // Process course allocation row (unchanged)
-  async processCourseAllocation(row, uploadId, rowNumber, uploadUser) {
-    console.log(`Processing course allocation row ${rowNumber}`);
-
-    // Get references
-    const session = await AcademicSession.findOne({
-      $or: [
-        { code: row.academic_session_code.trim() },
-        { name: row.academic_session_code.trim() },
-      ],
-    });
-
-    const program = await Program.findOne({ code: row.program_code.trim() });
-    const course = await Course.findOne({ code: row.course_code.trim() });
-
-    const teacher = await User.findOne({
-      email: row.teacher_email.trim().toLowerCase(),
-      role: "Teacher",
-    });
-
-    const semester = parseInt(row.semester);
-
-    // Find semester document
-    const semesterDoc = await mongoose.model("Semester").findOne({
-      $or: [
-        { name: `Semester ${semester}` },
-        { number: semester },
-        { semesterNumber: semester },
-      ],
-      academicSession: session._id,
-    });
-
-    const section = await Section.findOne({
-      code: row.section_code.trim(),
-      program: program._id,
-      semester: semesterDoc._id,
-      academicSession: session._id,
-    });
-
-    // Check for existing allocation
-    const existingAllocation = await CourseAllocation.findOne({
-      academicSession: session._id,
-      semester: semester,
-      course: course._id,
-      section: section._id,
-      status: { $ne: "cancelled" },
-    });
-
-    if (existingAllocation) {
-      // Update existing allocation
-      existingAllocation.teacher = teacher._id;
-      existingAllocation.creditHours = row.credit_hours
-        ? parseInt(row.credit_hours)
-        : course.creditHours;
-      existingAllocation.contactHoursPerWeek = row.contact_hours_per_week
-        ? parseInt(row.contact_hours_per_week)
-        : course.contactHours;
-      existingAllocation.maxStudents = row.max_students
-        ? parseInt(row.max_students)
-        : 50;
-      existingAllocation.isLab = row.is_lab
-        ? row.is_lab.toLowerCase() === "true"
-        : false;
-
-      if (
-        row.lab_teacher_email &&
-        row.is_lab &&
-        row.is_lab.toLowerCase() === "true"
-      ) {
-        const labTeacher = await User.findOne({
-          email: row.lab_teacher_email.trim().toLowerCase(),
-          role: "Teacher",
-        });
-        if (labTeacher) {
-          existingAllocation.labTeacher = labTeacher._id;
-        }
-      }
-
-      existingAllocation.notes = row.notes || "";
-      existingAllocation.status = "draft";
-
-      await existingAllocation.save();
-
-      return {
-        action: "updated",
-        allocationId: existingAllocation._id,
-        course: course.code,
-        section: section.code,
-        teacher: teacher.email,
-      };
-    } else {
-      // Create new allocation
-      const allocationData = {
-        academicSession: session._id,
-        semester: semester,
-        program: program._id,
-        course: course._id,
-        teacher: teacher._id,
-        section: section._id,
-        creditHours: row.credit_hours
-          ? parseInt(row.credit_hours)
-          : course.creditHours,
-        contactHoursPerWeek: row.contact_hours_per_week
-          ? parseInt(row.contact_hours_per_week)
-          : course.contactHours,
-        maxStudents: row.max_students ? parseInt(row.max_students) : 50,
-        isLab: row.is_lab ? row.is_lab.toLowerCase() === "true" : false,
-        notes: row.notes || "",
-        status: "draft",
-        createdBy: uploadUser, // Use upload user
-      };
-
-      if (row.lab_teacher_email && allocationData.isLab) {
-        const labTeacher = await User.findOne({
-          email: row.lab_teacher_email.trim().toLowerCase(),
-          role: "Teacher",
-        });
-        if (labTeacher) {
-          allocationData.labTeacher = labTeacher._id;
-        }
-      }
-
-      const allocation = new CourseAllocation(allocationData);
-      await allocation.save();
-
-      return {
-        action: "created",
-        allocationId: allocation._id,
-        course: course.code,
-        section: section.code,
-        teacher: teacher.email,
-      };
-    }
-  }
-
-  // Process timetable entry row (unchanged)
-  async processTimetableEntry(row, uploadId, rowNumber, uploadUser) {
-    console.log(`Processing timetable entry row ${rowNumber}`);
-
-    // Get references
-    const timetable = await Timetable.findOne({
-      name: row.timetable_name.trim(),
-      status: { $ne: "archived" },
-    });
-
-    const course = await Course.findOne({ code: row.course_code.trim() });
-    const teacher = await User.findOne({
-      email: row.teacher_email.trim().toLowerCase(),
-      role: "Teacher",
-    });
-
-    const timeSlot = await TimeSlot.findOne({
-      $or: [
-        { name: row.time_slot_name.trim() },
-        { timeRange: row.time_slot_name.trim() },
-      ],
-      isActive: true,
-    });
-
-    // Get or create allocation
-    let allocation = await CourseAllocation.findOne({
-      academicSession: timetable.academicSession,
-      semester: timetable.semester,
-      program: timetable.program,
-      course: course._id,
-      teacher: teacher._id,
-      section: timetable.section,
-      status: { $in: ["approved", "active", "draft"] },
-    });
-
-    if (!allocation) {
+    if (row.room_code && !refData.roomMap.has(row.room_code.toUpperCase())) {
       console.log(
-        "Creating automatic course allocation for timetable entry...",
-      );
-
-      allocation = new CourseAllocation({
-        academicSession: timetable.academicSession,
-        semester: timetable.semester,
-        program: timetable.program,
-        course: course._id,
-        teacher: teacher._id,
-        section: timetable.section,
-        creditHours: course.creditHours || 3,
-        contactHoursPerWeek: course.contactHours || 3,
-        maxStudents: course.maxStudents || 50,
-        status: "draft",
-        createdBy: uploadUser,
-      });
-      await allocation.save();
-      console.log(`✅ Created allocation: ${allocation._id}`);
-    }
-
-    // Find room if provided
-    let room = null;
-    if (row.room_code && row.room_code.trim()) {
-      const roomCode = row.room_code.trim().toUpperCase();
-      room = await Room.findOne({
-        $or: [
-          { roomNumber: roomCode },
-          { code: roomCode },
-          { name: { $regex: new RegExp(`^${roomCode}$`, "i") } },
-        ],
-        isAvailable: true,
-      });
-    }
-
-    // Create new entry
-    const newEntry = {
-      day: row.day.trim(),
-      timeSlot: timeSlot._id,
-      courseAllocation: allocation._id,
-      room: room ? room._id : null,
-      notes: row.notes || "",
-      createdBy: uploadUser,
-      createdAt: new Date(),
-    };
-
-    timetable.schedule.push(newEntry);
-    timetable.markModified("schedule");
-    await timetable.save();
-
-    // Get the created entry ID
-    const savedTimetable = await Timetable.findById(timetable._id);
-    let recordId;
-
-    if (savedTimetable.schedule.length > 0) {
-      const lastEntry =
-        savedTimetable.schedule[savedTimetable.schedule.length - 1];
-      recordId = lastEntry._id;
-    }
-
-    return {
-      action: "created",
-      recordId: recordId,
-      timetable: timetable.name,
-      day: row.day,
-      timeSlot: timeSlot.name,
-      course: course.code,
-      teacher: teacher.email,
-      timetableId: timetable._id,
-    };
-  }
-
-  // Process schedule entry row (unchanged - but note it uses uploadId which we have)
-  async processScheduleEntry(row, uploadId, rowNumber, uploadUser) {
-    console.log(`\n=== Processing Schedule Entry Row ${rowNumber} ===`);
-
-    // Log raw data
-    console.log("Row data:", JSON.stringify(row, null, 2));
-
-    // 1. Get Academic Session
-    const sessionCode = row.academic_session_code?.trim();
-    console.log(`Looking for session with code/name: "${sessionCode}"`);
-
-    let session = await AcademicSession.findOne({
-      $or: [{ code: sessionCode }, { name: sessionCode }],
-    });
-
-    // If not found by exact match, try case-insensitive search
-    if (!session) {
-      session = await AcademicSession.findOne({
-        $or: [
-          { code: { $regex: new RegExp(`^${sessionCode}$`, "i") } },
-          { name: { $regex: new RegExp(`^${sessionCode}$`, "i") } },
-        ],
-      });
-    }
-
-    if (!session) {
-      // Try to find any active session
-      const fallbackSession = await AcademicSession.findOne({ isActive: true });
-      if (fallbackSession) {
-        session = fallbackSession;
-        console.log(
-          `WARNING: Session "${sessionCode}" not found, using fallback: ${fallbackSession.code}`,
-        );
-      } else {
-        throw new Error(
-          `Academic session not found: ${sessionCode} in row ${rowNumber}`,
-        );
-      }
-    }
-
-    console.log(`Found Session: ${session.code} (${session.name})`);
-
-    // 2. Get Program
-    const programCode = row.program_code?.trim();
-    const program = await Program.findOne({
-      $or: [
-        { code: programCode },
-        { name: programCode },
-        { code: { $regex: new RegExp(`^${programCode}$`, "i") } },
-      ],
-    });
-    if (!program) {
-      throw new Error(`Program not found: ${programCode} in row ${rowNumber}`);
-    }
-
-    // 3. Get Semester
-    const semesterNumber = parseInt(row.semester);
-    if (isNaN(semesterNumber) || semesterNumber < 1 || semesterNumber > 8) {
-      throw new Error(`Invalid semester: ${row.semester} in row ${rowNumber}`);
-    }
-
-    // Find semester document
-    const Semester = mongoose.model("Semester");
-    let semesterDoc = await Semester.findOne({
-      $or: [
-        { name: `Semester ${semesterNumber}` },
-        { number: semesterNumber },
-        { semesterNumber: semesterNumber },
-      ],
-      academicSession: session._id,
-    });
-
-    // If semester doc not found, create it
-    if (!semesterDoc) {
-      console.log(
-        `Creating semester ${semesterNumber} for session ${session.code}`,
-      );
-      const newSemester = new Semester({
-        name: `Semester ${semesterNumber}`,
-        number: semesterNumber,
-        semesterNumber: semesterNumber,
-        academicSession: session._id,
-        isActive: true,
-      });
-      await newSemester.save();
-      semesterDoc = newSemester;
-    }
-
-    // 4. Get Section
-    const sectionCode = row.section_code?.trim();
-    let section = await Section.findOne({
-      code: sectionCode,
-      program: program._id,
-      semester: semesterDoc._id,
-      academicSession: session._id,
-    });
-
-    if (!section) {
-      console.log(
-        `Creating section ${sectionCode} for program ${program.code}, semester ${semesterNumber}`,
-      );
-      // Create section if it doesn't exist
-      const newSection = new Section({
-        code: sectionCode,
-        name: `Section ${sectionCode}`,
-        program: program._id,
-        semester: semesterDoc._id,
-        academicSession: session._id,
-        maxStudents: 50,
-      });
-      await newSection.save();
-      section = newSection;
-      console.log(`Created new section: ${section._id}`);
-    }
-
-    // 5. Get Course
-    const courseCode = row.course_code?.trim();
-    const course = await Course.findOne({
-      $or: [
-        { code: courseCode },
-        { courseCode: courseCode },
-        { code: { $regex: new RegExp(`^${courseCode}$`, "i") } },
-      ],
-    });
-    if (!course) {
-      throw new Error(`Course not found: ${courseCode} in row ${rowNumber}`);
-    }
-
-    // 6. Get Teacher
-    const teacherEmail = row.teacher_email?.trim().toLowerCase();
-    const teacher = await User.findOne({
-      email: teacherEmail,
-      role: "Teacher",
-    });
-    if (!teacher) {
-      throw new Error(`Teacher not found: ${teacherEmail} in row ${rowNumber}`);
-    }
-
-    // 7. Get Time Slot
-    const timeSlotName = row.time_slot_name?.trim();
-    let timeSlot = await TimeSlot.findOne({
-      $or: [
-        { name: timeSlotName },
-        { timeRange: timeSlotName },
-        { code: timeSlotName },
-      ],
-      isActive: true,
-    });
-
-    // If time slot not found, create it
-    if (!timeSlot) {
-      console.log(`Creating time slot: ${timeSlotName}`);
-      timeSlot = new TimeSlot({
-        name: timeSlotName,
-        timeRange: timeSlotName,
-        startTime: timeSlotName.split("-")[0],
-        endTime: timeSlotName.split("-")[1],
-        durationMinutes: 60,
-        isActive: true,
-      });
-      await timeSlot.save();
-    }
-
-    console.log(
-      `Found: Session=${session.code}, Program=${program.code}, Semester=${semesterNumber}, Section=${section.code}, Course=${course.code}, Teacher=${teacher.name}, TimeSlot=${timeSlot.name}`,
-    );
-
-    // 8. Find or create timetable
-    let timetable = await Timetable.findOne({
-      academicSession: session._id,
-      semester: semesterNumber,
-      program: program._id,
-      section: section._id,
-      status: { $ne: "archived" },
-    });
-
-    if (!timetable) {
-      timetable = new Timetable({
-        name: `${program.code} - Sem ${semesterNumber} - ${section.code}`,
-        academicSession: session._id,
-        semester: semesterNumber,
-        program: program._id,
-        section: section._id,
-        schedule: [],
-        status: "draft",
-        createdBy: uploadUser,
-      });
-      console.log(`Created new timetable: ${timetable.name}`);
-    } else {
-      console.log(`Found existing timetable: ${timetable.name}`);
-    }
-
-    // 9. Find or create course allocation
-    let allocation = await CourseAllocation.findOne({
-      academicSession: session._id,
-      semester: semesterNumber,
-      program: program._id,
-      course: course._id,
-      teacher: teacher._id,
-      section: section._id,
-      status: { $in: ["approved", "active", "draft"] },
-    });
-
-    if (!allocation) {
-      console.log("Creating automatic course allocation...");
-
-      // Get upload user for createdBy field
-      let createdByUser = null;
-      if (uploadId) {
-        const upload = await CSVUpload.findById(uploadId);
-        if (upload && upload.uploadedBy) {
-          createdByUser = upload.uploadedBy;
-        }
-      }
-
-      allocation = new CourseAllocation({
-        academicSession: session._id,
-        semester: semesterNumber,
-        program: program._id,
-        course: course._id,
-        teacher: teacher._id,
-        section: section._id,
-        creditHours: course.creditHours || 3,
-        contactHoursPerWeek: course.contactHours || 3,
-        maxStudents: course.maxStudents || 50,
-        isLab:
-          course.courseType === "Lab" || course.courseType === "Theory+Lab",
-        status: "draft",
-        createdBy: createdByUser || teacher._id,
-      });
-      await allocation.save();
-      console.log(`✅ Created allocation: ${allocation._id}`);
-    } else {
-      console.log(`✅ Existing allocation found: ${allocation._id}`);
-    }
-
-    // 10. Find room if provided
-    let room = null;
-    if (row.room_code && row.room_code.trim()) {
-      const roomCode = row.room_code.trim().toUpperCase();
-      room = await Room.findOne({
-        $or: [
-          { roomNumber: roomCode },
-          { code: roomCode },
-          { name: { $regex: new RegExp(`^${roomCode}$`, "i") } },
-        ],
-        isAvailable: true,
-      });
-      if (room) {
-        console.log(
-          `Found room: ${room.roomNumber || room.code} (${room.name})`,
-        );
-      } else {
-        console.log(
-          `WARNING: Room not found: ${roomCode}. Will create entry without room.`,
-        );
-      }
-    }
-
-    // 11. Create a NEW schedule entry
-    const newEntry = {
-      day: row.day.trim(),
-      timeSlot: timeSlot._id,
-      courseAllocation: allocation._id,
-      room: room ? room._id : null,
-      notes: row.notes || "",
-      createdBy: uploadUser,
-      createdAt: new Date(),
-    };
-
-    timetable.schedule.push(newEntry);
-    const action = "created";
-
-    console.log(
-      `Created new schedule entry for ${course.code} on ${row.day} at ${timeSlot.name}`,
-    );
-
-    // Mark schedule as modified
-    timetable.markModified("schedule");
-    await timetable.save();
-
-    // 12. Get the created entry ID
-    const savedTimetable = await Timetable.findById(timetable._id);
-    let recordId;
-
-    if (savedTimetable.schedule.length > 0) {
-      const lastEntry =
-        savedTimetable.schedule[savedTimetable.schedule.length - 1];
-      recordId = lastEntry._id;
-    }
-
-    console.log(
-      `=== Row ${rowNumber} processed: ${action} entry with ID ${recordId} ===\n`,
-    );
-
-    // 13. Immediate conflict check
-    const immediateConflicts = await this.checkImmediateConflicts(
-      timetable._id,
-      recordId,
-    );
-    if (immediateConflicts.length > 0) {
-      console.log(
-        `⚠️ Immediate conflicts detected: ${immediateConflicts.length}`,
+        `Warning: Room not found: ${row.room_code} in row ${rowNumber}`,
       );
     }
-
-    return {
-      action: action,
-      recordId: recordId,
-      timetable: timetable.name,
-      day: row.day,
-      timeSlot: timeSlot.name,
-      course: course.code,
-      teacher: teacher.email,
-      timetableId: timetable._id,
-      conflicts: immediateConflicts,
-    };
   }
 
-  // Process teacher row (unchanged)
-  async processTeacher(row, uploadId, rowNumber, uploadUser) {
-    const email = row.email.trim().toLowerCase();
+  async createUploadRecord(fileData, uploadType, userId, options) {
+    const filename = `${Date.now()}-${fileData.originalname}`;
 
-    // Check if teacher already exists
-    let teacher = await User.findOne({
-      email: email,
-      role: "Teacher",
+    const uploadRecord = new CSVUpload({
+      uploadType,
+      filename,
+      originalName: fileData.originalname,
+      fileSize: fileData.size,
+      filePath: null,
+      mimeType: fileData.mimetype,
+      uploadedBy: userId,
+      academicSession: options.academicSession || null,
+      semester: options.semester || null,
+      program: options.program || null,
+      validationRules: this.templates[uploadType] || {},
+      templateUsed: options.template || "default",
+      templateVersion: "1.0",
+      status: "uploaded",
     });
 
-    if (teacher) {
-      // Update existing teacher
-      teacher.name = row.name || teacher.name;
-      teacher.employeeId = row.employee_id || teacher.employeeId;
-
-      // Update department if provided
-      if (row.department_code) {
-        const department = await Department.findOne({
-          code: row.department_code.trim(),
-        });
-        if (department) {
-          teacher.department = department._id;
-        }
-      }
-
-      teacher.designation = row.designation || teacher.designation;
-      teacher.qualification = row.qualification || teacher.qualification;
-      teacher.specialization = row.specialization || teacher.specialization;
-
-      if (row.max_weekly_hours) {
-        teacher.maxWeeklyHours = parseInt(row.max_weekly_hours);
-      }
-
-      if (row.is_active !== undefined) {
-        teacher.isActive = row.is_active.toLowerCase() === "true";
-      }
-
-      teacher.status = "Approved";
-      await teacher.save();
-
-      return {
-        action: "updated",
-        teacherId: teacher._id,
-        name: teacher.name,
-        email: teacher.email,
-      };
-    } else {
-      // Create new teacher
-      const teacherData = {
-        name: row.name,
-        email: email,
-        password: "TempPassword123", // Will need to be reset
-        role: "Teacher",
-        employeeId: row.employee_id || `TEMP-${Date.now()}`,
-        status: "Approved",
-        isActive: row.is_active ? row.is_active.toLowerCase() === "true" : true,
-      };
-
-      // Add department if provided
-      if (row.department_code) {
-        const department = await Department.findOne({
-          code: row.department_code.trim(),
-        });
-        if (department) {
-          teacherData.department = department._id;
-        }
-      }
-
-      // Add additional fields
-      const additionalFields = {
-        designation: row.designation,
-        qualification: row.qualification,
-        specialization: row.specialization,
-      };
-
-      if (row.max_weekly_hours) {
-        additionalFields.maxWeeklyHours = parseInt(row.max_weekly_hours);
-      }
-
-      teacher = new User({
-        ...teacherData,
-        ...additionalFields,
-      });
-
-      await teacher.save();
-
-      return {
-        action: "created",
-        teacherId: teacher._id,
-        name: teacher.name,
-        email: teacher.email,
-      };
-    }
+    await uploadRecord.save();
+    return uploadRecord;
   }
 
-  // Process room row (unchanged)
-  async processRoom(row, uploadId, rowNumber, uploadUser) {
-    const roomNumber = row.code.trim().toUpperCase();
-
-    // Check if room already exists
-    let room = await Room.findOne({ roomNumber: roomNumber });
-
-    if (room) {
-      // Update existing room
-      room.name = row.name || room.name;
-      room.roomType = row.type || room.roomType;
-      room.building = row.building || room.building;
-      room.floor = row.floor || room.floor;
-      room.capacity = parseInt(row.capacity) || room.capacity;
-
-      if (row.resources) {
-        room.equipment = row.resources.split(",").map((r) => ({
-          name: r.trim(),
-          quantity: 1,
-          condition: "Good",
-        }));
-      }
-
-      room.isAvailable = row.is_active
-        ? row.is_active.toLowerCase() === "true"
-        : room.isAvailable;
-
-      await room.save();
-
-      return {
-        action: "updated",
-        roomId: room._id,
-        code: room.roomNumber,
-        name: room.name,
-      };
-    } else {
-      // Create new room - need department, using Computer Science as default
-      const csDepartment = await Department.findOne({ code: "CS" });
-      if (!csDepartment) {
-        throw new Error("Default Computer Science department not found");
-      }
-
-      room = new Room({
-        roomNumber: roomNumber,
-        name: row.name || `Room ${roomNumber}`,
-        roomType: row.type || "Lecture",
-        building: row.building || "Main Building",
-        floor: row.floor || "1",
-        capacity: parseInt(row.capacity),
-        department: csDepartment._id,
-        equipment: row.resources
-          ? row.resources.split(",").map((r) => ({
-              name: r.trim(),
-              quantity: 1,
-              condition: "Good",
-            }))
-          : [],
-        isAvailable: row.is_active
-          ? row.is_active.toLowerCase() === "true"
-          : true,
-      });
-
-      await room.save();
-
-      return {
-        action: "created",
-        roomId: room._id,
-        code: room.roomNumber,
-        name: room.name,
-      };
+  async updateUploadStatus(uploadId, status, progress, additionalData = {}) {
+    const updateData = { status, progress, ...additionalData };
+    if (status === "processing" && !additionalData.processingStartedAt) {
+      updateData.processingStartedAt = new Date();
     }
+    if (["completed", "failed", "partial_success"].includes(status)) {
+      updateData.processingCompletedAt = new Date();
+    }
+    await CSVUpload.findByIdAndUpdate(uploadId, updateData);
   }
 
-  // Check schedule conflicts (unchanged)
-  async checkScheduleConflicts(
-    row,
-    rowNumber,
-    session,
-    program,
-    semesterNum,
-    teacher,
-    timeSlot,
-    room,
-  ) {
-    console.log(`Checking conflicts for row ${rowNumber}`);
-
-    const conflicts = {
-      teacherConflicts: [],
-      roomConflicts: [],
-      validationErrors: [],
-    };
-
-    try {
-      // Check for teacher conflicts
-      if (teacher && session && semesterNum && timeSlot && row.day) {
-        // Find timetables for this session and semester
-        const timetables = await Timetable.find({
-          academicSession: session._id,
-          semester: semesterNum,
-          status: { $ne: "archived" },
-        })
-          .populate({
-            path: "schedule.courseAllocation",
-            populate: [{ path: "teacher" }, { path: "course" }],
-          })
-          .populate("schedule.timeSlot");
-
-        for (const timetable of timetables) {
-          for (const entry of timetable.schedule) {
-            if (
-              entry.day === row.day &&
-              entry.timeSlot &&
-              timeSlot &&
-              entry.timeSlot._id.toString() === timeSlot._id.toString()
-            ) {
-              if (
-                entry.courseAllocation &&
-                entry.courseAllocation.teacher &&
-                entry.courseAllocation.teacher._id.toString() ===
-                  teacher._id.toString()
-              ) {
-                conflicts.teacherConflicts.push({
-                  row: rowNumber,
-                  teacher: teacher.email,
-                  timetable: timetable.name,
-                  course: entry.courseAllocation.course?.code || "Unknown",
-                  day: row.day,
-                  timeSlot: timeSlot.name,
-                  message: `Teacher ${teacher.name} already has ${entry.courseAllocation.course?.code || "a class"} at ${row.day} ${timeSlot.name} in ${timetable.name}`,
-                });
-              }
-            }
-          }
-        }
-      }
-
-      // Check for room conflicts
-      if (room && session && semesterNum && timeSlot && row.day) {
-        const timetables = await Timetable.find({
-          academicSession: session._id,
-          semester: semesterNum,
-          status: { $ne: "archived" },
-        })
-          .populate("schedule.room")
-          .populate("schedule.timeSlot")
-          .populate({
-            path: "schedule.courseAllocation",
-            populate: [{ path: "course" }],
-          });
-
-        for (const timetable of timetables) {
-          for (const entry of timetable.schedule) {
-            if (
-              entry.day === row.day &&
-              entry.timeSlot &&
-              timeSlot &&
-              entry.timeSlot._id.toString() === timeSlot._id.toString() &&
-              entry.room &&
-              entry.room._id.toString() === room._id.toString()
-            ) {
-              conflicts.roomConflicts.push({
-                row: rowNumber,
-                room: room.roomNumber || room.code,
-                timetable: timetable.name,
-                course: entry.courseAllocation?.course?.code || "Unknown",
-                day: row.day,
-                timeSlot: timeSlot.name,
-                message: `Room ${room.roomNumber || room.code} is already booked for ${entry.courseAllocation?.course?.code || "a class"} at ${row.day} ${timeSlot.name} in ${timetable.name}`,
-              });
-            }
-          }
-        }
-      }
-    } catch (error) {
-      console.error(`Error checking conflicts for row ${rowNumber}:`, error);
-      conflicts.validationErrors.push({
-        row: rowNumber,
-        message: `Conflict check error: ${error.message}`,
-      });
-    }
-
-    console.log(`Conflict check results for row ${rowNumber}:`, {
-      teacherConflicts: conflicts.teacherConflicts.length,
-      roomConflicts: conflicts.roomConflicts.length,
-    });
-
-    return conflicts;
+  async addErrorToUpload(uploadId, row, column, value, error, message) {
+    const upload = await CSVUpload.findById(uploadId);
+    if (upload) await upload.addError(row, column, value, error, message);
   }
 
-  // Run post-upload conflict detection (unchanged)
-  async runPostUploadConflictDetection(timetableIds, uploadId, userId) {
-    const conflicts = [];
-
-    try {
-      console.log(
-        `Running post-upload conflict detection for ${timetableIds.length} timetables`,
-      );
-
-      for (const timetableId of timetableIds) {
-        const timetable = await Timetable.findById(timetableId)
-          .populate({
-            path: "schedule.courseAllocation",
-            populate: [{ path: "teacher" }, { path: "course" }],
-          })
-          .populate("schedule.room")
-          .populate("schedule.timeSlot");
-
-        if (!timetable) continue;
-
-        console.log(
-          `Checking timetable ${timetable.name} with ${timetable.schedule.length} entries`,
-        );
-
-        const teacherSchedule = {};
-        const roomSchedule = {};
-
-        // Detect conflicts
-        for (const entry of timetable.schedule) {
-          if (!entry.timeSlot) continue;
-
-          const timeKey = `${entry.day}-${entry.timeSlot._id}`;
-
-          // Teacher conflicts
-          if (entry.courseAllocation?.teacher) {
-            const teacherKey = `${timeKey}-${entry.courseAllocation.teacher._id}`;
-            if (teacherSchedule[teacherKey]) {
-              // Create conflict document
-              const conflictData = {
-                type: "teacher_schedule",
-                conflictType: "teacher_schedule",
-                severity: "critical",
-                description: `Teacher ${entry.courseAllocation.teacher.name} has overlapping classes on ${entry.day} at ${entry.timeSlot.name}`,
-                timetable: timetable._id,
-                scheduleEntry: entry._id,
-                teacher: entry.courseAllocation.teacher._id,
-                detectionSource: "csv_upload",
-                status: "detected",
-                detectedBy: userId,
-                uploadReference: uploadId,
-              };
-
-              // Remove undefined fields
-              Object.keys(conflictData).forEach(
-                (key) =>
-                  conflictData[key] === undefined && delete conflictData[key],
-              );
-
-              const conflict = new Conflict(conflictData);
-              await conflict.save();
-              conflicts.push(conflict);
-              console.log(`Created teacher conflict: ${conflict.description}`);
-            } else {
-              teacherSchedule[teacherKey] = true;
-            }
-          }
-
-          // Room conflicts
-          if (entry.room) {
-            const roomKey = `${timeKey}-${entry.room._id}`;
-            if (roomSchedule[roomKey]) {
-              const conflictData = {
-                type: "room_occupancy",
-                conflictType: "room_occupancy",
-                severity: "high",
-                description: `Room ${entry.room.roomNumber || entry.room.code} is double-booked on ${entry.day} at ${entry.timeSlot.name}`,
-                timetable: timetable._id,
-                scheduleEntry: entry._id,
-                room: entry.room._id,
-                detectionSource: "csv_upload",
-                status: "detected",
-                detectedBy: userId,
-                uploadReference: uploadId,
-              };
-
-              Object.keys(conflictData).forEach(
-                (key) =>
-                  conflictData[key] === undefined && delete conflictData[key],
-              );
-
-              const conflict = new Conflict(conflictData);
-              await conflict.save();
-              conflicts.push(conflict);
-              console.log(`Created room conflict: ${conflict.description}`);
-            } else {
-              roomSchedule[roomKey] = true;
-            }
-          }
-        }
-      }
-
-      console.log(`Created ${conflicts.length} conflicts in total`);
-    } catch (error) {
-      console.error("Error in post-upload conflict detection:", error);
-    }
-
-    return conflicts;
+  async addSuccessToUpload(uploadId, recordId, row, details) {
+    const upload = await CSVUpload.findById(uploadId);
+    if (upload) await upload.addSuccess(recordId, row, details);
   }
 
-  // Check immediate conflicts (unchanged)
-  async checkImmediateConflicts(timetableId, entryId) {
-    const conflicts = [];
-
-    try {
-      const timetable = await Timetable.findById(timetableId)
-        .populate({
-          path: "schedule.courseAllocation",
-          populate: [{ path: "teacher" }, { path: "course" }],
-        })
-        .populate("schedule.room")
-        .populate("schedule.timeSlot");
-
-      if (!timetable) return conflicts;
-
-      // Check for teacher conflicts within same timetable
-      const teacherSchedule = {};
-      for (const entry of timetable.schedule) {
-        if (!entry.courseAllocation?.teacher || !entry.timeSlot) continue;
-
-        const key = `${entry.day}-${entry.timeSlot._id.toString()}`;
-        const teacherKey = `${key}-${entry.courseAllocation.teacher._id.toString()}`;
-
-        if (teacherSchedule[teacherKey]) {
-          // Found conflict
-          conflicts.push({
-            type: "teacher_conflict",
-            message: `Teacher ${entry.courseAllocation.teacher.name} has multiple classes at ${entry.day} ${entry.timeSlot.name}`,
-            severity: "critical",
-            entryId: entry._id,
-          });
-        } else {
-          teacherSchedule[teacherKey] = true;
-        }
-      }
-
-      // Check for room conflicts
-      const roomSchedule = {};
-      for (const entry of timetable.schedule) {
-        if (!entry.room || !entry.timeSlot) continue;
-
-        const key = `${entry.day}-${entry.timeSlot._id.toString()}`;
-        const roomKey = `${key}-${entry.room._id.toString()}`;
-
-        if (roomSchedule[roomKey]) {
-          conflicts.push({
-            type: "room_conflict",
-            message: `Room ${entry.room.roomNumber || entry.room.code} is double-booked at ${entry.day} ${entry.timeSlot.name}`,
-            severity: "high",
-            entryId: entry._id,
-          });
-        } else {
-          roomSchedule[roomKey] = true;
-        }
-      }
-    } catch (error) {
-      console.error("Error in immediate conflict check:", error);
-    }
-
-    return conflicts;
-  }
-
-  // Generate result files (using temp directory)
   async generateResultFiles(uploadRecord, results) {
     const resultFiles = {};
 
-    // Generate error report if there are errors
     if (results.errors.length > 0) {
       const errorFilePath = path.join(
         this.resultsDir,
         `errors-${uploadRecord.filename}`,
       );
-
       const csvWriter = createObjectCsvWriter({
         path: errorFilePath,
         header: [
@@ -2057,25 +1179,22 @@ class CSVProcessorService {
         ],
       });
 
-      const errorData = results.errors.map((error) => ({
-        row: error.row,
-        error: error.error,
-        data: JSON.stringify(error.data),
-      }));
+      await csvWriter.writeRecords(
+        results.errors.map((error) => ({
+          row: error.row,
+          error: error.error,
+          data: JSON.stringify(error.data),
+        })),
+      );
 
-      await csvWriter.writeRecords(errorData);
-
-      // Note: These URLs are for reference only - files are temporary
       resultFiles.errorReportUrl = `/api/csv/download-error-report/${uploadRecord._id}`;
     }
 
-    // Generate success report if there are successes
     if (results.successes.length > 0) {
       const successFilePath = path.join(
         this.resultsDir,
         `success-${uploadRecord.filename}`,
       );
-
       const csvWriter = createObjectCsvWriter({
         path: successFilePath,
         header: [
@@ -2086,14 +1205,14 @@ class CSVProcessorService {
         ],
       });
 
-      const successData = results.successes.map((success) => ({
-        row: success.row,
-        action: success.result.action,
-        details: JSON.stringify(success.result),
-        data: JSON.stringify(success.data),
-      }));
-
-      await csvWriter.writeRecords(successData);
+      await csvWriter.writeRecords(
+        results.successes.map((success) => ({
+          row: success.row,
+          action: success.result.action,
+          details: JSON.stringify(success.result),
+          data: JSON.stringify(success.data),
+        })),
+      );
 
       resultFiles.resultFileUrl = `/api/csv/download-success-report/${uploadRecord._id}`;
     }
@@ -2101,46 +1220,6 @@ class CSVProcessorService {
     return resultFiles;
   }
 
-  // Update upload status
-  async updateUploadStatus(uploadId, status, progress, additionalData = {}) {
-    const updateData = {
-      status,
-      progress,
-      ...additionalData,
-    };
-
-    if (status === "processing" && !additionalData.processingStartedAt) {
-      updateData.processingStartedAt = new Date();
-    }
-
-    if (
-      status === "completed" ||
-      status === "failed" ||
-      status === "partial_success"
-    ) {
-      updateData.processingCompletedAt = new Date();
-    }
-
-    await CSVUpload.findByIdAndUpdate(uploadId, updateData);
-  }
-
-  // Add error to upload record
-  async addErrorToUpload(uploadId, row, column, value, error, message) {
-    const upload = await CSVUpload.findById(uploadId);
-    if (upload) {
-      await upload.addError(row, column, value, error, message);
-    }
-  }
-
-  // Add success to upload record
-  async addSuccessToUpload(uploadId, recordId, row, details) {
-    const upload = await CSVUpload.findById(uploadId);
-    if (upload) {
-      await upload.addSuccess(recordId, row, details);
-    }
-  }
-
-  // Finalize upload
   async finalizeUpload(uploadId, results, resultFiles) {
     const status =
       results.failed > 0 && results.successful > 0
@@ -2163,20 +1242,12 @@ class CSVProcessorService {
     });
   }
 
-  // Get upload user
-  async getUploadUser(uploadId) {
-    const upload = await CSVUpload.findById(uploadId).populate("uploadedBy");
-    return upload.uploadedBy._id;
-  }
-
-  // Get CSV template (unchanged)
   getCSVTemplate(uploadType) {
     const template = this.templates[uploadType];
     if (!template) {
       throw new Error(`No template found for upload type: ${uploadType}`);
     }
 
-    // Create sample data for template
     const sampleData = {};
     template.columns.forEach((column) => {
       switch (column) {
@@ -2204,38 +1275,11 @@ class CSVProcessorService {
         case "time_slot_name":
           sampleData[column] = "08:30-09:30";
           break;
-        case "credit_hours":
-          sampleData[column] = "3";
-          break;
-        case "contact_hours_per_week":
-          sampleData[column] = "3";
-          break;
-        case "max_students":
-          sampleData[column] = "50";
-          break;
-        case "is_lab":
-          sampleData[column] = "false";
-          break;
         case "room_code":
           sampleData[column] = "CL-101";
           break;
-        case "name":
-          sampleData[column] = "John Doe";
-          break;
-        case "email":
-          sampleData[column] = "john@university.edu";
-          break;
-        case "employee_id":
-          sampleData[column] = "EMP-001";
-          break;
-        case "department_code":
-          sampleData[column] = "CS";
-          break;
-        case "capacity":
-          sampleData[column] = "50";
-          break;
-        case "code":
-          sampleData[column] = "CL-101";
+        case "notes":
+          sampleData[column] = "Optional notes";
           break;
         default:
           sampleData[column] = "Sample Value";
@@ -2250,11 +1294,9 @@ class CSVProcessorService {
     };
   }
 
-  // Download template as CSV (unchanged)
   async downloadTemplate(uploadType) {
     const template = this.getCSVTemplate(uploadType);
 
-    // Create CSV content
     let csvContent = template.columns.join(",") + "\n";
     template.sampleData.forEach((row) => {
       const rowData = template.columns.map((col) => `"${row[col] || ""}"`);
@@ -2268,108 +1310,210 @@ class CSVProcessorService {
     };
   }
 
-  // Debug teacher lookup (unchanged)
-  async debugTeacherLookup(email) {
-    console.log("\n=== DEBUG TEACHER LOOKUP ===");
-    console.log("Looking for teacher with email:", email);
-
-    const normalizedEmail = email.trim().toLowerCase();
-    console.log("Normalized email:", normalizedEmail);
-
-    // Try different queries
-    const queries = [
-      { email: normalizedEmail },
-      { email: normalizedEmail, role: "Teacher" },
-      { email: normalizedEmail, role: "Teacher", status: "Approved" },
-      {
-        email: normalizedEmail,
-        role: "Teacher",
-        status: { $in: ["Approved", "Pending"] },
-      },
-    ];
-
-    for (let i = 0; i < queries.length; i++) {
-      const query = queries[i];
-      const teacher = await User.findOne(query);
-      console.log(`Query ${i + 1}:`, JSON.stringify(query));
-      console.log(
-        `Result:`,
-        teacher ? `Found: ${teacher.name} (${teacher.status})` : "Not found",
-      );
+  async validateRow(row, uploadType, rowNumber) {
+    const template = this.templates[uploadType];
+    if (!template) {
+      throw new Error(`No template found for upload type: ${uploadType}`);
     }
 
-    // Check all teachers in database
-    const allTeachers = await User.find({ role: "Teacher" });
-    console.log("\nAll teachers in DB:");
-    allTeachers.forEach((t) => {
-      console.log(`- ${t.name}: ${t.email} (Status: ${t.status})`);
-    });
-
-    console.log("=== END DEBUG ===\n");
-  }
-
-  // Validate CSV with debugging (unchanged)
-  async validateCSVWithDebugging(fileData, uploadType, userId) {
-    console.log("\n=== CSV VALIDATION WITH DEBUGGING ===");
-
-    const rows = [];
-    await new Promise((resolve, reject) => {
-      const bufferStream = new stream.PassThrough();
-      bufferStream.end(fileData.buffer);
-
-      bufferStream
-        .pipe(csv())
-        .on("data", (row) => {
-          rows.push(row);
-        })
-        .on("end", () => {
-          resolve();
-        })
-        .on("error", (error) => {
-          reject(error);
-        });
-    });
-
-    console.log(`Total rows: ${rows.length}`);
-
-    // Validate each row with debugging
-    for (let i = 0; i < rows.length; i++) {
-      const row = rows[i];
-      const rowNumber = i + 1;
-
-      console.log(`\n--- Row ${rowNumber} ---`);
-      console.log("Raw row data:", JSON.stringify(row));
-
-      try {
-        // Trim all values
-        const trimmedRow = {};
-        Object.keys(row).forEach((key) => {
-          trimmedRow[key] =
-            typeof row[key] === "string" ? row[key].trim() : row[key];
-        });
-
-        await this.validateRow(trimmedRow, uploadType, rowNumber);
-        console.log(`✅ Row ${rowNumber} validation passed`);
-      } catch (error) {
-        console.log(`❌ Row ${rowNumber} validation failed:`, error.message);
-
-        // Debug teacher lookup for this row
-        if (
-          error.message.includes("Teacher not found") &&
-          trimmedRow.teacher_email
-        ) {
-          await this.debugTeacherLookup(trimmedRow.teacher_email);
-        }
+    for (const requiredColumn of template.required) {
+      if (
+        !row[requiredColumn] ||
+        row[requiredColumn].toString().trim() === ""
+      ) {
+        throw new Error(
+          `Required column '${requiredColumn}' is empty or missing in row ${rowNumber}`,
+        );
       }
     }
+  }
 
-    console.log("=== END CSV VALIDATION ===\n");
+  async checkScheduleConflicts(
+    row,
+    rowNumber,
+    session,
+    program,
+    semesterNum,
+    teacher,
+    timeSlot,
+    room,
+    options = {},
+  ) {
+    const teacherConflicts = [];
+    const roomConflicts = [];
+    const validationErrors = [];
+
+    console.log(`Checking conflicts for row ${rowNumber}:`, {
+      session: session?._id,
+      program: program?._id,
+      semester: semesterNum,
+      teacher: teacher?._id,
+      timeSlot: timeSlot?._id,
+      room: room?._id,
+      day: row.day,
+    });
+
+    if (!teacher || !timeSlot || !session || !program || !semesterNum) {
+      console.log("Missing required data for conflict check:", {
+        hasTeacher: !!teacher,
+        hasTimeSlot: !!timeSlot,
+        hasSession: !!session,
+        hasProgram: !!program,
+        hasSemester: !!semesterNum,
+      });
+      return { teacherConflicts, roomConflicts, validationErrors };
+    }
+
+    try {
+      // Build query for existing timetables in same session/program/semester
+      const query = {
+        academicSession: session._id,
+        program: program._id,
+        semester: semesterNum,
+        status: { $ne: "archived" },
+      };
+
+      // If options.excludeTimetableIds is provided, exclude those timetables
+      if (
+        options.excludeTimetableIds &&
+        options.excludeTimetableIds.length > 0
+      ) {
+        query._id = { $nin: options.excludeTimetableIds };
+      }
+
+      console.log("Conflict check query:", JSON.stringify(query));
+
+      // Find all relevant timetables
+      const timetables = await Timetable.find(query)
+        .populate({
+          path: "schedule.courseAllocation",
+          populate: [
+            { path: "teacher", select: "_id name email" },
+            { path: "course", select: "_id code name" },
+          ],
+        })
+        .populate("schedule.room", "_id roomNumber code name")
+        .populate("schedule.timeSlot", "_id name timeRange")
+        .lean();
+
+      console.log(
+        `Found ${timetables.length} timetables to check for conflicts`,
+      );
+
+      // Check for teacher conflicts
+      if (teacher) {
+        for (const timetable of timetables) {
+          for (const entry of timetable.schedule) {
+            if (!entry.timeSlot || !entry.courseAllocation?.teacher) continue;
+
+            // Check if same teacher, same day, same time slot
+            if (
+              entry.courseAllocation.teacher._id.toString() ===
+                teacher._id.toString() &&
+              entry.day === row.day &&
+              entry.timeSlot._id.toString() === timeSlot._id.toString()
+            ) {
+              console.log(`Teacher conflict detected in row ${rowNumber}:`, {
+                teacher: teacher.email,
+                day: row.day,
+                timeSlot: timeSlot.name,
+              });
+
+              teacherConflicts.push({
+                type: "teacher_conflict",
+                timetable: timetable.name || `${timetable._id}`,
+                day: entry.day,
+                timeSlot: entry.timeSlot.name || entry.timeSlot.timeRange,
+                existingCourse:
+                  entry.courseAllocation.course?.code || "Unknown",
+                existingTeacher: entry.courseAllocation.teacher.name,
+                message: `Teacher ${teacher.name} already has a class (${entry.courseAllocation.course?.code || "Unknown"}) at this time on ${entry.day}`,
+              });
+            }
+          }
+        }
+      }
+
+      // Check for room conflicts
+      if (room) {
+        for (const timetable of timetables) {
+          for (const entry of timetable.schedule) {
+            if (!entry.timeSlot || !entry.room) continue;
+
+            // Check if same room, same day, same time slot
+            if (
+              entry.room._id.toString() === room._id.toString() &&
+              entry.day === row.day &&
+              entry.timeSlot._id.toString() === timeSlot._id.toString()
+            ) {
+              console.log(`Room conflict detected in row ${rowNumber}:`, {
+                room: room.roomNumber || room.code,
+                day: row.day,
+                timeSlot: timeSlot.name,
+              });
+
+              roomConflicts.push({
+                type: "room_conflict",
+                timetable: timetable.name || `${timetable._id}`,
+                day: entry.day,
+                timeSlot: entry.timeSlot.name || entry.timeSlot.timeRange,
+                existingCourse:
+                  entry.courseAllocation?.course?.code || "Unknown",
+                message: `Room ${room.roomNumber || room.code} is already booked for ${entry.courseAllocation?.course?.code || "another class"} at this time on ${entry.day}`,
+              });
+            }
+          }
+        }
+      }
+
+      console.log(`Row ${rowNumber} conflicts found:`, {
+        teacherConflicts: teacherConflicts.length,
+        roomConflicts: roomConflicts.length,
+      });
+    } catch (error) {
+      console.error("Error checking conflicts:", error);
+      validationErrors.push({
+        type: "system_error",
+        message: error.message,
+      });
+    }
+
+    return {
+      teacherConflicts,
+      roomConflicts,
+      validationErrors,
+    };
+  }
+
+  async runPostUploadConflictDetection(timetableIds, uploadId, userId) {
+    console.log(
+      `Running post-upload conflict detection for ${timetableIds.length} timetables`,
+    );
+
+    try {
+      if (!timetableIds || timetableIds.length === 0) {
+        return [];
+      }
+
+      // Use the conflict detection engine with uploadId for row mapping
+      const conflicts =
+        await this.conflictDetectionEngine.detectConflictsForUpload(
+          timetableIds,
+          userId,
+          `csv_upload_${uploadId}`,
+          uploadId,
+        );
+
+      console.log(`Post-upload detection found ${conflicts.length} conflicts`);
+      return conflicts;
+    } catch (error) {
+      console.error("Error in post-upload conflict detection:", error);
+      return [];
+    }
   }
 }
 
-// Create and export instance
 const csvProcessorService = new CSVProcessorService();
 export default csvProcessorService;
-
-// Also export conflictDetectionEngine for use in controller
-export { conflictDetectionEngine };
+export const conflictDetectionEngine =
+  csvProcessorService.conflictDetectionEngine;

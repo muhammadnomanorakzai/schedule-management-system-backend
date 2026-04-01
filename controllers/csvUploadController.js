@@ -1,5 +1,7 @@
-import csvProcessorService from "../services/csvProcessorService.js";
-import conflictDetectionEngine from "../services/conflictDetectionService.js";
+// import csvProcessorService from "../services/csvProcessorService.js";
+import csvProcessorService, {
+  conflictDetectionEngine,
+} from "../services/csvProcessorService.js";
 import CSVUpload from "../models/CSVUpload.js";
 import Timetable from "../models/Timetable.js";
 import Conflict from "../models/Conflict.js";
@@ -14,7 +16,8 @@ import stream from "stream";
 // import fs from "fs";
 import AcademicSession from "../models/AcademicSession.js";
 import Program from "../models/Program.js";
-import { downloadFromCloudinary } from "../services/cloudinaryService.js";
+// Remove cloudinary service import
+// import { downloadFromCloudinary } from "../services/cloudinaryService.js";
 
 // @desc    Upload CSV file for bulk processing
 // @route   POST /api/csv/upload
@@ -65,7 +68,7 @@ export const uploadCSV = async (req, res) => {
       });
     }
 
-    // Process CSV
+    // Process CSV directly from buffer
     const result = await csvProcessorService.processCSV(
       req.file,
       uploadType,
@@ -352,7 +355,7 @@ export const getUploadById = async (req, res) => {
   }
 };
 
-// @desc    Retry failed upload - UPDATED with Cloudinary
+// @desc    Retry failed upload - MODIFIED to remove Cloudinary dependency
 // @route   POST /api/csv/uploads/:id/retry
 // @access  Private (Admin, HOD)
 export const retryUpload = async (req, res) => {
@@ -373,11 +376,31 @@ export const retryUpload = async (req, res) => {
       });
     }
 
-    // Check if we have cloudinary info
-    if (!upload.cloudinaryUrl && !upload.cloudinaryId) {
+    // Since we're no longer storing files in Cloudinary, we need to inform the user
+    // that they need to upload the file again
+    return res.status(400).json({
+      success: false,
+      message:
+        "Original file not available for retry. Please upload the file again.",
+      requiresNewUpload: true,
+      uploadId: upload._id,
+      uploadType: upload.uploadType,
+      metadata: {
+        academicSession: upload.academicSession,
+        semester: upload.semester,
+        program: upload.program,
+      },
+    });
+
+    /* 
+    // Alternative approach if you want to store the buffer temporarily:
+    // You would need to modify the uploadCSV function to store the buffer
+    // in MongoDB or temporary storage, then retrieve it here
+    
+    if (!upload.fileBuffer) {
       return res.status(400).json({
         success: false,
-        message: "Original CSV file not found in cloud storage",
+        message: "Original file not available for retry",
       });
     }
 
@@ -397,31 +420,15 @@ export const retryUpload = async (req, res) => {
 
     await upload.save();
 
-    // Fetch file from Cloudinary
-    let fileBuffer;
-    try {
-      fileBuffer = await downloadFromCloudinary(upload.cloudinaryUrl);
-    } catch (fetchError) {
-      console.error("Error fetching file from Cloudinary:", fetchError);
-      upload.status = "failed";
-      upload.summary = `Retry failed: Could not fetch file from cloud storage`;
-      await upload.save();
-
-      return res.status(400).json({
-        success: false,
-        message: "Could not retrieve original file from cloud storage",
-      });
-    }
-
     // Create file data object for processing
     const fileData = {
       originalname: upload.originalName,
-      buffer: fileBuffer,
+      buffer: upload.fileBuffer, // You would need to store this
       size: upload.fileSize,
       mimetype: upload.mimeType || "text/csv",
     };
 
-    // Process immediately (in production, use a queue)
+    // Process immediately
     const result = await csvProcessorService.processCSV(
       fileData,
       upload.uploadType,
@@ -452,11 +459,11 @@ export const retryUpload = async (req, res) => {
       data: updatedUpload,
       results: result.results || {},
     });
+    */
   } catch (error) {
     console.error("Error retrying upload:", error);
 
     // Update upload status to failed if upload exists
-    // Note: upload variable is not in scope here, so we need to handle differently
     try {
       await CSVUpload.findByIdAndUpdate(req.params.id, {
         status: "failed",
@@ -764,6 +771,9 @@ export const getUploadConflicts = async (req, res) => {
 // @desc    Analyze CSV for conflicts before uploading
 // @route   POST /api/csv/analyze-conflicts
 // @access  Private (Teacher, Admin, HOD)
+// @desc    Analyze CSV for conflicts before uploading (IMPROVED)
+// @route   POST /api/csv/analyze-conflicts
+// @access  Private (Teacher, Admin, HOD)
 export const analyzeCSVConflicts = async (req, res) => {
   try {
     if (!req.file) {
@@ -798,7 +808,13 @@ export const analyzeCSVConflicts = async (req, res) => {
       bufferStream
         .pipe(csv())
         .on("data", (row) => {
-          rows.push(row);
+          // Clean row data
+          const cleanedRow = {};
+          Object.keys(row).forEach((key) => {
+            cleanedRow[key.trim()] =
+              typeof row[key] === "string" ? row[key].trim() : row[key];
+          });
+          rows.push(cleanedRow);
         })
         .on("end", () => {
           resolve();
@@ -808,117 +824,169 @@ export const analyzeCSVConflicts = async (req, res) => {
         });
     });
 
-    // Analyze each row for potential conflicts
+    // Get academic session and program if IDs are provided
+    let sessionFilter = null;
+    let programFilter = null;
+    let semesterFilter = null;
+
+    if (academicSession) {
+      sessionFilter = await AcademicSession.findById(academicSession);
+    }
+    if (program) {
+      programFilter = await Program.findById(program);
+    }
+    if (semester) {
+      semesterFilter = parseInt(semester);
+    }
+
+    // Pre-load all reference data for validation
+    const referenceData = await loadReferenceDataForAnalysis(rows);
+
+    // Build a map of all potential conflicts from the CSV itself (internal conflicts)
+    const internalConflicts = new Map(); // key: teacher-day-timeSlot or room-day-timeSlot
+
+    // First pass: Detect conflicts WITHIN the CSV
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const rowNumber = i + 1;
+
+      // Create keys for internal conflict checking
+      const teacherKey = `${row.teacher_email}-${row.day}-${row.time_slot_name}`;
+      const roomKey = row.room_code
+        ? `${row.room_code.toUpperCase()}-${row.day}-${row.time_slot_name}`
+        : null;
+
+      // Check teacher conflicts within CSV
+      if (!internalConflicts.has(teacherKey)) {
+        internalConflicts.set(teacherKey, []);
+      }
+      internalConflicts.get(teacherKey).push({
+        row: rowNumber,
+        type: "teacher_conflict",
+        data: row,
+      });
+
+      // Check room conflicts within CSV
+      if (roomKey) {
+        if (!internalConflicts.has(roomKey)) {
+          internalConflicts.set(roomKey, []);
+        }
+        internalConflicts.get(roomKey).push({
+          row: rowNumber,
+          type: "room_conflict",
+          data: row,
+        });
+      }
+    }
+
+    // Analyze each row for conflicts with database
     const analysisResults = [];
     const allConflicts = [];
+    const conflictRowMap = new Map(); // Track which rows have conflicts
 
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
       const rowNumber = i + 1;
 
       try {
-        // Validate the row first
+        // Validate the row first using reference data
         await csvProcessorService.validateRow(row, uploadType, rowNumber);
 
-        // Get references for conflict checking
+        // Get references for conflict checking using pre-loaded data
         let session = null;
         let prog = null;
         let teacher = null;
         let timeSlot = null;
         let room = null;
 
-        try {
-          // Get academic session
-          if (row.academic_session_code) {
-            session = await AcademicSession.findOne({
-              $or: [
-                { code: row.academic_session_code.trim() },
-                { name: row.academic_session_code.trim() },
-              ],
-            });
-          }
+        // Get academic session
+        if (row.academic_session_code) {
+          session = referenceData.sessionMap.get(row.academic_session_code);
+        }
 
-          // Get program
-          if (row.program_code) {
-            prog = await Program.findOne({
-              $or: [
-                { code: row.program_code.trim() },
-                { name: row.program_code.trim() },
-              ],
-            });
-          }
+        // Get program
+        if (row.program_code) {
+          prog = referenceData.programMap.get(row.program_code);
+        }
 
-          // Get teacher
-          if (row.teacher_email) {
-            teacher = await User.findOne({
-              email: row.teacher_email.trim().toLowerCase(),
-              role: "Teacher",
-            });
-          }
-
-          // Get time slot
-          if (row.time_slot_name) {
-            timeSlot = await TimeSlot.findOne({
-              $or: [
-                { name: row.time_slot_name.trim() },
-                { timeRange: row.time_slot_name.trim() },
-              ],
-              isActive: true,
-            });
-          }
-
-          // Get room
-          if (row.room_code && row.room_code.trim()) {
-            room = await Room.findOne({
-              $or: [
-                { roomNumber: row.room_code.trim().toUpperCase() },
-                { code: row.room_code.trim().toUpperCase() },
-              ],
-              isAvailable: true,
-            });
-          }
-        } catch (refError) {
-          console.log(
-            `Error getting references for row ${rowNumber}:`,
-            refError.message,
+        // Get teacher
+        if (row.teacher_email) {
+          teacher = referenceData.teacherMap.get(
+            row.teacher_email.toLowerCase(),
           );
         }
 
-        // Check for conflicts using the CSV processor service
+        // Get time slot
+        if (row.time_slot_name) {
+          timeSlot = referenceData.timeSlotMap.get(row.time_slot_name);
+        }
+
+        // Get room
+        if (row.room_code && row.room_code.trim()) {
+          room = referenceData.roomMap.get(row.room_code.trim().toUpperCase());
+        }
+
+        // Check for conflicts with database using session/program/semester filters
         const conflicts = await csvProcessorService.checkScheduleConflicts(
           row,
           rowNumber,
-          session,
-          prog,
-          row.semester ? parseInt(row.semester) : null,
+          sessionFilter || session,
+          programFilter || prog,
+          semesterFilter || (row.semester ? parseInt(row.semester) : null),
           teacher,
           timeSlot,
           room,
+          { excludeTimetableIds: [] }, // No exclusions for analysis
         );
+
+        // Check for internal CSV conflicts
+        const teacherKey = `${row.teacher_email}-${row.day}-${row.time_slot_name}`;
+        const roomKey = row.room_code
+          ? `${row.room_code.toUpperCase()}-${row.day}-${row.time_slot_name}`
+          : null;
+
+        const internalTeacherConflicts =
+          internalConflicts.get(teacherKey) || [];
+        const internalRoomConflicts = roomKey
+          ? internalConflicts.get(roomKey) || []
+          : [];
+
+        const hasInternalTeacherConflict = internalTeacherConflicts.length > 1;
+        const hasInternalRoomConflict = internalRoomConflicts.length > 1;
 
         const rowAnalysis = {
           row: rowNumber,
           data: row,
           isValid: true,
           conflicts: conflicts || {},
+          internalConflicts: {
+            teacher: hasInternalTeacherConflict,
+            room: hasInternalRoomConflict,
+          },
           hasConflicts: false,
         };
 
         // Check if there are any conflicts
         if (
-          conflicts &&
-          (conflicts.teacherConflicts.length > 0 ||
-            conflicts.roomConflicts.length > 0 ||
-            conflicts.validationErrors.length > 0)
+          (conflicts &&
+            (conflicts.teacherConflicts.length > 0 ||
+              conflicts.roomConflicts.length > 0 ||
+              conflicts.validationErrors.length > 0)) ||
+          hasInternalTeacherConflict ||
+          hasInternalRoomConflict
         ) {
           rowAnalysis.hasConflicts = true;
+          conflictRowMap.set(rowNumber, true);
 
-          // Add to all conflicts list
+          // Add database conflicts
           if (conflicts.teacherConflicts.length > 0) {
             allConflicts.push({
               type: "teacher_conflict",
+              source: "database",
               row: rowNumber,
               teacher: row.teacher_email,
+              day: row.day,
+              timeSlot: row.time_slot_name,
               conflicts: conflicts.teacherConflicts,
             });
           }
@@ -926,9 +994,59 @@ export const analyzeCSVConflicts = async (req, res) => {
           if (conflicts.roomConflicts.length > 0) {
             allConflicts.push({
               type: "room_conflict",
+              source: "database",
               row: rowNumber,
               room: row.room_code,
+              day: row.day,
+              timeSlot: row.time_slot_name,
               conflicts: conflicts.roomConflicts,
+            });
+          }
+
+          // Add internal CSV conflicts
+          if (hasInternalTeacherConflict) {
+            const conflictingRows = internalTeacherConflicts
+              .filter((c) => c.row !== rowNumber)
+              .map((c) => c.row);
+
+            allConflicts.push({
+              type: "teacher_conflict",
+              source: "csv_internal",
+              row: rowNumber,
+              teacher: row.teacher_email,
+              day: row.day,
+              timeSlot: row.time_slot_name,
+              conflictingRows: conflictingRows,
+              conflicts: [
+                {
+                  message: `Teacher ${row.teacher_email} appears multiple times in the same time slot (rows: ${conflictingRows.join(", ")})`,
+                  day: row.day,
+                  timeSlot: row.time_slot_name,
+                },
+              ],
+            });
+          }
+
+          if (hasInternalRoomConflict) {
+            const conflictingRows = internalRoomConflicts
+              .filter((c) => c.row !== rowNumber)
+              .map((c) => c.row);
+
+            allConflicts.push({
+              type: "room_conflict",
+              source: "csv_internal",
+              row: rowNumber,
+              room: row.room_code,
+              day: row.day,
+              timeSlot: row.time_slot_name,
+              conflictingRows: conflictingRows,
+              conflicts: [
+                {
+                  message: `Room ${row.room_code} appears multiple times in the same time slot (rows: ${conflictingRows.join(", ")})`,
+                  day: row.day,
+                  timeSlot: row.time_slot_name,
+                },
+              ],
             });
           }
         }
@@ -945,16 +1063,34 @@ export const analyzeCSVConflicts = async (req, res) => {
       }
     }
 
+    // Deduplicate conflicts (remove duplicates)
+    const uniqueConflicts = [];
+    const conflictKeyMap = new Map();
+
+    for (const conflict of allConflicts) {
+      let key;
+      if (conflict.type === "teacher_conflict") {
+        key = `${conflict.type}-${conflict.teacher}-${conflict.day}-${conflict.timeSlot}`;
+      } else {
+        key = `${conflict.type}-${conflict.room}-${conflict.day}-${conflict.timeSlot}`;
+      }
+
+      if (!conflictKeyMap.has(key)) {
+        conflictKeyMap.set(key, true);
+        uniqueConflicts.push(conflict);
+      }
+    }
+
     // Generate summary
     const summary = {
       totalRows: rows.length,
       validRows: analysisResults.filter((r) => r.isValid).length,
-      rowsWithConflicts: analysisResults.filter((r) => r.hasConflicts).length,
-      totalConflicts: allConflicts.length,
+      rowsWithConflicts: conflictRowMap.size,
+      totalConflicts: uniqueConflicts.length,
       conflictTypes: {
-        teacher: allConflicts.filter((c) => c.type === "teacher_conflict")
+        teacher: uniqueConflicts.filter((c) => c.type === "teacher_conflict")
           .length,
-        room: allConflicts.filter((c) => c.type === "room_conflict").length,
+        room: uniqueConflicts.filter((c) => c.type === "room_conflict").length,
       },
     };
 
@@ -962,18 +1098,19 @@ export const analyzeCSVConflicts = async (req, res) => {
       success: true,
       data: {
         analysis: analysisResults,
-        conflicts: allConflicts,
+        conflicts: uniqueConflicts,
         summary: summary,
         recommendations:
           summary.rowsWithConflicts > 0
             ? [
-                "Some rows have conflicts. Review them before uploading.",
-                "Consider adjusting time slots or rooms for conflicting entries.",
-                "Check teacher availability for the scheduled times.",
+                "⚠️ Conflicts detected in your CSV file.",
+                "• Some rows conflict with existing schedule entries in the database.",
+                "• Some rows conflict with other rows within the same CSV file.",
+                "Please review the conflicts before uploading.",
               ]
             : [
-                "No conflicts detected. Ready to upload.",
-                "All schedule entries appear to be valid.",
+                "✓ No conflicts detected. Ready to upload.",
+                "All schedule entries appear to be valid and don't conflict with existing data.",
               ],
       },
     });
@@ -985,6 +1122,92 @@ export const analyzeCSVConflicts = async (req, res) => {
     });
   }
 };
+
+// Helper function to load reference data for analysis
+async function loadReferenceDataForAnalysis(rows) {
+  // Extract unique values
+  const sessionCodes = new Set();
+  const programCodes = new Set();
+  const teacherEmails = new Set();
+  const timeSlotNames = new Set();
+  const roomCodes = new Set();
+
+  rows.forEach((row) => {
+    if (row.academic_session_code)
+      sessionCodes.add(row.academic_session_code.trim());
+    if (row.program_code) programCodes.add(row.program_code.trim());
+    if (row.teacher_email)
+      teacherEmails.add(row.teacher_email.trim().toLowerCase());
+    if (row.time_slot_name) timeSlotNames.add(row.time_slot_name.trim());
+    if (row.room_code) roomCodes.add(row.room_code.trim().toUpperCase());
+  });
+
+  // Load all data in parallel
+  const [sessions, programs, teachers, timeSlots, rooms] = await Promise.all([
+    AcademicSession.find({
+      $or: [
+        { code: { $in: Array.from(sessionCodes) } },
+        { name: { $in: Array.from(sessionCodes) } },
+      ],
+    }).lean(),
+
+    Program.find({
+      code: { $in: Array.from(programCodes) },
+    }).lean(),
+
+    User.find({
+      email: { $in: Array.from(teacherEmails) },
+      role: "Teacher",
+    }).lean(),
+
+    TimeSlot.find({
+      $or: [
+        { name: { $in: Array.from(timeSlotNames) } },
+        { timeRange: { $in: Array.from(timeSlotNames) } },
+      ],
+      isActive: true,
+    }).lean(),
+
+    Room.find({
+      $or: [
+        { roomNumber: { $in: Array.from(roomCodes) } },
+        { code: { $in: Array.from(roomCodes) } },
+      ],
+      isAvailable: true,
+    }).lean(),
+  ]);
+
+  // Create lookup maps
+  const sessionMap = new Map();
+  sessions.forEach((s) => {
+    sessionMap.set(s.code, s);
+    if (s.name) sessionMap.set(s.name, s);
+  });
+
+  const programMap = new Map(programs.map((p) => [p.code, p]));
+
+  const teacherMap = new Map(teachers.map((t) => [t.email.toLowerCase(), t]));
+
+  const timeSlotMap = new Map();
+  timeSlots.forEach((ts) => {
+    timeSlotMap.set(ts.name, ts);
+    if (ts.timeRange) timeSlotMap.set(ts.timeRange, ts);
+  });
+
+  const roomMap = new Map();
+  rooms.forEach((r) => {
+    roomMap.set(r.roomNumber, r);
+    if (r.code) roomMap.set(r.code, r);
+  });
+
+  return {
+    sessionMap,
+    programMap,
+    teacherMap,
+    timeSlotMap,
+    roomMap,
+  };
+}
 
 // @desc    Get schedule entries from a CSV upload
 // @route   GET /api/csv/uploads/:id/schedule-entries
